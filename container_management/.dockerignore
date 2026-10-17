@@ -1,0 +1,22 @@
+# Keep secrets, dev tooling and caches out of the build context/image.
+.env
+.env.*
+!.env.example
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+tests/
+Dockerfile
+.dockerignore
+README.md
+.gitignore
+.git/
