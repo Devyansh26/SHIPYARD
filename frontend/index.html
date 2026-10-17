@@ -4,9 +4,22 @@
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>frontend</title>
+    <title>ShipYard — ship your repo to your own cloud</title>
+    <meta name="description" content="Self-hosted deployment platform. Model services on an infinite canvas, connect your own Vercel account, and deploy from GitHub." />
   </head>
   <body>
+    <script>
+      // Stamp the theme before first paint so a dark-mode reload never flashes
+      // white. Must match initialTheme() in src/lib/theme.tsx.
+      (function () {
+        try {
+          var stored = localStorage.getItem('shipyard-theme');
+          var dark = stored === 'dark'
+            || (stored !== 'light' && window.matchMedia('(prefers-color-scheme: dark)').matches);
+          document.documentElement.dataset.theme = dark ? 'dark' : 'light';
+        } catch (e) { /* blocked storage — default light */ }
+      })();
+    </script>
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>

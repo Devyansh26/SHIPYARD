@@ -1,0 +1,144 @@
+### ShipYard control-plane manual tests (VS Code REST Client). Login via browser first to get the session cookie.
+
+@base = http://localhost:3001/api/v1
+
+# Ids are opaque strings minted by the app (prj_..., svc_...), not integers.
+# Paste real ones from the create/list responses into these two variables.
+@projectId = prj_replace_me
+@serviceId = svc_replace_me
+
+### Health
+GET {{base}}/health
+
+### Ready (SELECT 1)
+GET {{base}}/ready
+
+### Me (needs Cookie: shipyard_session=...)
+GET {{base}}/auth/me
+
+### Logout
+POST {{base}}/auth/logout
+
+### GitHub repos
+GET {{base}}/auth/github/repos?per_page=30
+
+### Branches
+GET {{base}}/auth/github/repos/octocat/hello-world/branches
+
+### Commits (recent 20)
+GET {{base}}/auth/github/repos/octocat/hello-world/commits
+
+### Create project
+POST {{base}}/projects
+Content-Type: application/json
+
+{ "name": "demo-app", "githubUrl": "https://github.com/octocat/hello-world" }
+
+### Create project without githubUrl -> 400 (github_url is NOT NULL)
+POST {{base}}/projects
+Content-Type: application/json
+
+{ "name": "no-repo" }
+
+### List projects
+GET {{base}}/projects
+
+### Get project
+GET {{base}}/projects/{{projectId}}
+
+### Rename project
+PATCH {{base}}/projects/{{projectId}}
+Content-Type: application/json
+
+{ "name": "demo-app-v2" }
+
+### List services
+GET {{base}}/projects/{{projectId}}/services
+
+### Create service (serviceType must be frontend|backend|database; repository is required)
+POST {{base}}/projects/{{projectId}}/services
+Content-Type: application/json
+
+{ "name": "api", "serviceType": "backend", "repository": "octocat/hello-world", "branch": "main", "rootDirectory": ".", "buildCommand": "npm run build", "startCommand": "node dist/index.js" }
+
+### Create a database service (engine goes in service_config, not service_type)
+POST {{base}}/projects/{{projectId}}/services
+Content-Type: application/json
+
+{ "name": "db", "serviceType": "database", "repository": "octocat/hello-world", "serviceConfig": { "engine": "postgres", "version": "16" } }
+
+### Invalid service_type -> 400 VALIDATION_ERROR
+POST {{base}}/projects/{{projectId}}/services
+Content-Type: application/json
+
+{ "name": "db2", "serviceType": "postgres", "repository": "octocat/hello-world" }
+
+### Get service
+GET {{base}}/projects/{{projectId}}/services/{{serviceId}}
+
+### Update service branch
+PATCH {{base}}/projects/{{projectId}}/services/{{serviceId}}
+Content-Type: application/json
+
+{ "branch": "release/v2" }
+
+### Delete service
+DELETE {{base}}/projects/{{projectId}}/services/{{serviceId}}
+
+### Delete project (409 if non-terminal deployments exist)
+DELETE {{base}}/projects/{{projectId}}
+
+### ---------------------------------------------------------------- connections
+### List provider connections (also reports whether Vercel OAuth is configured)
+GET {{base}}/connections
+
+### Connect Vercel by OAuth (open in a browser - this 302s to vercel.com).
+### Returns 501 VERCEL_OAUTH_NOT_CONFIGURED if the VERCEL_* env vars are unset.
+GET {{base}}/connections/vercel/authorize
+
+### Connect Vercel by access token (works with no integration registered)
+POST {{base}}/connections/vercel/token
+Content-Type: application/json
+
+{ "token": "<token from vercel.com/account/settings/tokens>" }
+
+### Connect Vercel scoped to a team instead of the personal account
+POST {{base}}/connections/vercel/token
+Content-Type: application/json
+
+{ "token": "<vercel token>", "teamId": "team_xxxxxxxxxxxx" }
+
+### Live identity check against Vercel (404 if not connected)
+GET {{base}}/connections/vercel
+
+### Disconnect (marks the row revoked)
+DELETE {{base}}/connections/vercel
+
+### ---------------------------------------------------------------- deployments
+### Deploy a frontend/backend service to Vercel.
+### 409 VERCEL_NOT_CONNECTED    -> Vercel not connected yet
+### 409 DEPLOYMENT_IN_PROGRESS  -> one is already running for this service
+### 400 UNSUPPORTED_SERVICE_TYPE -> service_type is `database`
+POST {{base}}/projects/{{projectId}}/services/{{serviceId}}/deployments
+Content-Type: application/json
+
+{}
+
+### Deploy a specific branch as a preview
+POST {{base}}/projects/{{projectId}}/services/{{serviceId}}/deployments
+Content-Type: application/json
+
+{ "branch": "feature/x", "target": "preview" }
+
+### List deployments (syncs every non-terminal row from Vercel first)
+GET {{base}}/projects/{{projectId}}/services/{{serviceId}}/deployments
+
+### Poll one deployment until status is healthy and the url is set
+@deploymentId = dep_replace_me
+GET {{base}}/deployments/{{deploymentId}}
+
+### Build logs (proxied live from Vercel)
+GET {{base}}/deployments/{{deploymentId}}/logs
+
+### Cancel an in-flight deployment (409 if already terminal)
+POST {{base}}/deployments/{{deploymentId}}/cancel
