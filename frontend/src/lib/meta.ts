@@ -12,7 +12,9 @@ export const TYPE_META: Record<ServiceType, { label: string; hint: string; deplo
   },
   backend: {
     label: 'Backend',
-    hint: 'API or serverless functions — deploys to Vercel',
+    // Backend services go to the container host via the Container Management
+    // Service, NOT to Vercel — see mern_backend providers/container.js.
+    hint: 'API or worker — runs as a container on your own host',
     deployable: true,
   },
   database: {

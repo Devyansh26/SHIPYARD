@@ -5,6 +5,7 @@ import { validate } from '../../middleware/validate.js';
 import { asyncHandler } from '../../utils/asyncHandler.js';
 import { SERVICE_TYPES } from './serviceTypes.js';
 import { listServices, createService, getService, updateService, deleteService, updateServiceCanvas } from './repository.js';
+import { teardownServiceContainers } from '../deployments/service.js';
 
 // NOT NULL in the schema: service_name, service_type, repository, branch,
 // root_directory, service_config. Those can never be patched to null.
@@ -107,8 +108,20 @@ router.patch('/:serviceId/canvas', validate(canvasSchema), asyncHandler(async (r
 }));
 
 router.delete('/:serviceId', asyncHandler(async (req, res) => {
-  await deleteService(req.userId, req.params.projectId, req.params.serviceId);
-  res.status(204).send();
+  const { projectId, serviceId } = req.params;
+  // Read the service BEFORE deleting: once the row is gone (and its deployments
+  // with it, via ON DELETE CASCADE) we can no longer find the container ids.
+  const service = await getService(req.userId, projectId, serviceId);
+  const teardown = await teardownServiceContainers(req.userId, serviceId, {
+    projectId,
+    serviceType: service.serviceType,
+  }).catch((e) => ({ queued: 0, error: e.code ?? 'ERROR' }));
+
+  await deleteService(req.userId, projectId, serviceId);
+
+  // 200 with a body rather than 204, so the client can see whether a container
+  // teardown was queued. A failed teardown does not fail the delete.
+  res.json({ deleted: { id: serviceId }, teardown });
 }));
 
 export default router;

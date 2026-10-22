@@ -13,4 +13,5 @@ export const ID = {
   project: () => newId('prj'),
   service: () => newId('svc'),
   deployment: () => newId('dep'),
+  envVar: () => newId('env'),
 };

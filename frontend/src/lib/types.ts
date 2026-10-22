@@ -17,6 +17,19 @@ export type Project = {
 
 export type CanvasMeta = { x: number; y: number; dependsOn?: string[] }
 
+/** service_config.container — shape mirrors the CMS job contract exactly. */
+export type PortMapping = {
+  containerPort: number
+  hostPort?: number | null
+  protocol?: 'tcp' | 'udp'
+}
+
+export type ContainerMeta = {
+  ports?: PortMapping[]
+  resources?: { cpuLimit?: string | null; memoryLimit?: string | null } | null
+  healthCheck?: { path?: string | null; port?: number | null } | null
+}
+
 export type VercelMeta = {
   framework?: string | null
   outputDirectory?: string | null
@@ -37,7 +50,15 @@ export type Service = {
   buildCommand: string | null
   preDeployCommand: string | null
   startCommand: string | null
-  serviceConfig: { canvas?: CanvasMeta; vercel?: VercelMeta } & Record<string, unknown>
+  serviceConfig: {
+    canvas?: CanvasMeta
+    /** frontend services only */
+    vercel?: VercelMeta
+    /** backend services only */
+    container?: ContainerMeta
+    /** database services only */
+    engine?: string
+  } & Record<string, unknown>
   createdAt: string | null
   updatedAt: string | null
 }
@@ -70,12 +91,44 @@ export type Deployment = {
   isTerminal: boolean
 }
 
+export type EnvScope = 'production' | 'preview' | 'all'
+
+export type EnvVar = {
+  id: string
+  serviceId: string
+  key: string
+  sensitive: boolean
+  scope: EnvScope
+  /** Non-sensitive vars only; null for secrets. */
+  valuePreview: string | null
+  /** Character count of the decrypted value — shown instead of a secret. */
+  valueLength: number | null
+  decryptable: boolean
+  createdAt: string | null
+  updatedAt: string | null
+}
+
+export type EnvImportResult = {
+  vars: EnvVar[]
+  created: number
+  updated: number
+  skipped: { line: number; text: string; reason: string }[]
+}
+
 export type Connection = {
   id: string
   providerType: string
   externalAccountId: string | null
   scope: 'team' | 'personal'
   status: string
+}
+
+export type ContainerTarget = {
+  type: 'container'
+  reachable: boolean
+  accountName?: string | null
+  scope?: string
+  error?: { code?: string; message?: string }
 }
 
 export type Repo = {

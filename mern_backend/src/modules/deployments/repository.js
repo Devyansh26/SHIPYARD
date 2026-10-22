@@ -77,20 +77,72 @@ export async function createDeployment({ serviceId, commitSha, branch, configSna
 
 // config_snapshot is merged (jsonb ||) rather than replaced so concurrent
 // status writes cannot drop the provider refs written by the trigger path.
-export async function patchDeployment(deploymentId, { status, url, snapshotPatch, finished }) {
+export async function patchDeployment(
+  deploymentId,
+  { status, url, snapshotPatch, finished, containerId, imageId } = {}
+) {
   const { rows } = await query(
     `UPDATE deployments SET
        status = COALESCE($2, status),
        deployment_url = COALESCE($3, deployment_url),
        config_snapshot = CASE WHEN $4::boolean THEN config_snapshot || $5::jsonb ELSE config_snapshot END,
-       finished_at = CASE WHEN $6::boolean THEN NOW() ELSE finished_at END
+       finished_at = CASE WHEN $6::boolean THEN NOW() ELSE finished_at END,
+       container_id = COALESCE($7, container_id),
+       image_id = COALESCE($8, image_id)
      WHERE deployment_id = $1
      RETURNING ${COLS}`,
     [deploymentId, status ?? null, url ?? null,
-     snapshotPatch !== undefined, JSON.stringify(snapshotPatch ?? {}), Boolean(finished)]
+     snapshotPatch !== undefined, JSON.stringify(snapshotPatch ?? {}), Boolean(finished),
+     containerId ?? null, imageId ?? null]
   );
   return rows[0];
 }
+
+/**
+ * The container deployment this service is currently running, if any — the one
+ * a redeploy has to supersede. Only a `healthy` row with a container_id counts:
+ * anything else is either still coming up or already gone.
+ */
+export async function findRunningContainerDeployment(serviceId) {
+  const { rows } = await query(
+    `SELECT deployment_id, container_id, service_id FROM deployments
+     WHERE service_id = $1 AND status = 'healthy' AND container_id IS NOT NULL
+     ORDER BY created_at DESC LIMIT 1`,
+    [serviceId]
+  );
+  return rows[0] ?? null;
+}
+
+/** Every distinct container this service still has running, for teardown. */
+export async function findServiceContainers(serviceId) {
+  const { rows } = await query(
+    `SELECT DISTINCT ON (container_id) deployment_id, container_id
+     FROM deployments
+     WHERE service_id = $1 AND container_id IS NOT NULL
+       AND status NOT IN ('failed', 'cancelled', 'rolled_back')
+     ORDER BY container_id, created_at DESC`,
+    [serviceId]
+  );
+  return rows;
+}
+
+/**
+ * Used by the worker status webhook, which has no user session to scope on.
+ * `deployments` and `services` both have a service_id column, so the select
+ * list must be qualified or Postgres raises 42702.
+ */
+export async function getDeploymentById(deploymentId) {
+  const { rows } = await query(
+    `SELECT ${COLS.split(',').map((c) => `d.${c.trim()}`).join(', ')},
+            s.project_id, s.service_name, s.service_type
+     FROM deployments d
+     JOIN services s ON s.service_id = d.service_id
+     WHERE d.deployment_id = $1`,
+    [deploymentId]
+  );
+  return rows[0] ?? null;
+}
+
 
 export async function getOwnedDeployment(userId, deploymentId) {
   const { rows } = await query(

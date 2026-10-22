@@ -12,6 +12,8 @@ import projectRoutes from './modules/projects/routes.js';
 import serviceRoutes from './modules/services/routes.js';
 import connectionRoutes from './modules/connections/routes.js';
 import { serviceDeploymentRoutes, deploymentRoutes } from './modules/deployments/routes.js';
+import envVarRoutes from './modules/envvars/routes.js';
+import internalRoutes from './modules/internal/routes.js';
 
 export function createApp() {
   const app = express();
@@ -37,7 +39,11 @@ export function createApp() {
   app.use('/api/v1/projects/:projectId/services', serviceRoutes);
   // Deployments: nested for create/list, flat for read/logs/cancel.
   app.use('/api/v1/projects/:projectId/services/:serviceId/deployments', serviceDeploymentRoutes);
+  // Environment variables: encrypted at rest, pushed to the provider on deploy.
+  app.use('/api/v1/projects/:projectId/services/:serviceId/env', envVarRoutes);
   app.use('/api/v1/deployments', deploymentRoutes);
+  // Service-to-service (CMS / deployment worker), shared-secret auth, no session.
+  app.use('/api/v1/internal', internalRoutes);
 
   app.use(notFound);
   app.use(errorHandler);

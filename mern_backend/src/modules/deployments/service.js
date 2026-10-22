@@ -10,16 +10,44 @@
 // `syncDeployment` only.
 import { loadGithubToken } from '../auth/tokens.js';
 import { github } from '../auth/github.js';
-import { createAdapter } from '../providers/index.js';
+import {
+  createAdapter, createKeylessAdapter, targetForServiceType, DEPLOYABLE_SERVICE_TYPES,
+} from '../providers/index.js';
+import { buildDeploymentJob, containerConfig } from '../providers/container.js';
 import { parseRepository, slugifyProjectName, isTerminal } from '../providers/vercel.js';
 import { requireConnection, linkServiceConnection } from '../connections/repository.js';
+import { loadEnvForDeploy } from '../envvars/repository.js';
+import { query } from '../../db/pool.js';
 import {
   getOwnedService, assertNoActiveDeployment, createDeployment, patchDeployment,
   getOwnedDeployment, listDeploymentsForService, incrementUserDeployments, serializeDeployment,
+  findRunningContainerDeployment, findServiceContainers, getDeploymentById,
 } from './repository.js';
 
-// Vercel hosts frontends and serverless backends, but not a database.
-const DEPLOYABLE_TYPES = ['frontend', 'backend'];
+/**
+ * Resolves the deployment target for a service and builds its adapter.
+ *
+ * The service_type -> provider mapping lives in `providers/index.js`; this only
+ * acts on the `requiresConnection` flag, which is the one real difference
+ * between a provider the user authorises with their own credential (Vercel) and
+ * our own infrastructure (containers via CMS), which has no per-user credential.
+ */
+async function resolveTarget(userId, serviceType) {
+  const target = targetForServiceType(serviceType);
+  if (!target) {
+    const e = new Error(
+      `service_type "${serviceType}" cannot be deployed. `
+      + `Deployable types: ${DEPLOYABLE_SERVICE_TYPES.join(', ')}.`
+    );
+    e.status = 400; e.code = 'UNSUPPORTED_SERVICE_TYPE'; throw e;
+  }
+  if (!target.requiresConnection) {
+    return { ...target, adapter: createKeylessAdapter(target.provider), connection: null };
+  }
+  // 409 <PROVIDER>_NOT_CONNECTED — the signal the UI turns into "Connect …".
+  const connection = await requireConnection(userId, target.provider);
+  return { ...target, adapter: adapterFor(connection), connection };
+}
 
 function adapterFor(connectionRow) {
   return createAdapter({
@@ -51,18 +79,7 @@ function buildSnapshot(service, parsed, vercelCfg) {
 
 export async function triggerDeployment(userId, projectId, serviceId, opts = {}) {
   const service = await getOwnedService(userId, projectId, serviceId);
-
-  if (!DEPLOYABLE_TYPES.includes(service.service_type)) {
-    const e = new Error(
-      `service_type "${service.service_type}" cannot be deployed to Vercel. `
-      + `Deployable types: ${DEPLOYABLE_TYPES.join(', ')}.`
-    );
-    e.status = 400; e.code = 'UNSUPPORTED_SERVICE_TYPE'; throw e;
-  }
-
-  // 409 VERCEL_NOT_CONNECTED — the signal the UI turns into "Connect Vercel".
-  const connection = await requireConnection(userId, 'vercel');
-  const adapter = adapterFor(connection);
+  const target = await resolveTarget(userId, service.service_type);
 
   await assertNoActiveDeployment(serviceId);
 
@@ -84,16 +101,21 @@ export async function triggerDeployment(userId, projectId, serviceId, opts = {})
   const deployTarget = opts.target ?? vercelCfg.target ?? 'production';
 
   const snapshot = buildSnapshot(service, parsed, vercelCfg);
-  snapshot.provider = { type: 'vercel', projectName, target: deployTarget };
+  snapshot.provider = { type: target.provider, projectName, target: deployTarget };
+
+  // A container job sits on a queue until a worker claims it, so it starts as
+  // `queued`; Vercel starts building the moment we call it.
+  const initialStatus = target.provider === 'container' ? 'queued' : 'validating';
 
   // The row exists before any provider call, so a failure stays visible as a
   // `failed` deployment instead of vanishing.
   const row = await createDeployment({ serviceId, commitSha, branch, configSnapshot: snapshot });
 
   try {
-    await patchDeployment(row.deployment_id, { status: 'validating' });
+    await patchDeployment(row.deployment_id, { status: initialStatus });
 
-    const project = await adapter.ensureProject({
+    const project = await target.adapter.ensureProject({
+      serviceId: service.service_id,
       name: projectName,
       repoFullName: parsed.fullName,
       framework: vercelCfg.framework ?? null,
@@ -103,10 +125,27 @@ export async function triggerDeployment(userId, projectId, serviceId, opts = {})
       outputDirectory: vercelCfg.outputDirectory ?? null,
     });
 
-    // Remember which account owns the deployment target for this service.
-    await linkServiceConnection(serviceId, connection.connection_id);
+    if (target.connection) {
+      // Remember which account owns the deployment target for this service.
+      await linkServiceConnection(serviceId, target.connection.connection_id);
+    }
 
-    const started = await adapter.deploy({
+    const envVars = await loadEnvForDeploy(serviceId);
+
+    if (target.provider === 'container') {
+      return await deployToContainer({
+        userId, service, parsed, branch, commitSha, envVars, row, snapshot, adapter: target.adapter,
+      });
+    }
+
+    // --- Vercel ------------------------------------------------------------
+    // Push env vars BEFORE starting the build: Vercel snapshots project env at
+    // build time, so syncing afterwards would not reach this deployment. A
+    // failure here fails the deploy on purpose — shipping without the
+    // variables the user configured produces a silently broken app.
+    const envResult = await target.adapter.syncEnv({ projectId: project.id, vars: envVars });
+
+    const started = await target.adapter.deploy({
       projectId: project.id,
       projectName: project.name,
       repoId: repoMeta.id,
@@ -127,6 +166,9 @@ export async function triggerDeployment(userId, projectId, serviceId, opts = {})
           deploymentId: started.providerDeploymentId,
           inspectorUrl: started.inspectorUrl,
         },
+        // Keys only — never values. This is an audit trail of what the build
+        // was given, and config_snapshot is returned to the browser.
+        env: { count: envVars.length, keys: envVars.map((v) => v.key), synced: envResult },
       },
       finished: false,
     });
@@ -144,12 +186,80 @@ export async function triggerDeployment(userId, projectId, serviceId, opts = {})
   }
 }
 
+/**
+ * Enqueues a container build via CMS.
+ *
+ * The replace/cutover: if this service already has a running container, the job
+ * carries `supersedes`. CMS holds that until the new deployment reports healthy
+ * and only then queues the teardown of the old container — create first, delete
+ * second, so a failed build never takes the running container down.
+ *
+ * Note what does NOT happen here: no env sync call (the values travel inside
+ * the job) and no status poll (the worker pushes status to our webhook).
+ */
+async function deployToContainer({
+  userId, service, parsed, branch, commitSha, envVars, row, snapshot, adapter,
+}) {
+  const running = await findRunningContainerDeployment(service.service_id);
+  const supersedes = running
+    ? {
+      deployment_id: String(running.deployment_id),
+      container_id: running.container_id,
+      service_id: String(service.service_id),
+      project_id: String(service.project_id),
+    }
+    : null;
+
+  const job = buildDeploymentJob({
+    deploymentId: String(row.deployment_id),
+    service,
+    parsed,
+    commitSha,
+    branch,
+    envVars,
+    retryCount: row.retry_count ?? 0,
+    supersedes,
+  });
+
+  const queued = await adapter.deploy(job);
+  const { ports, resources, healthCheck } = containerConfig(service.service_config);
+
+  const updated = await patchDeployment(row.deployment_id, {
+    status: queued.status,
+    snapshotPatch: {
+      provider: {
+        ...snapshot.provider,
+        // The job is keyed by our own deployment id, so there is no separate
+        // provider-side id to remember.
+        deploymentId: String(row.deployment_id),
+        queue: queued.queue,
+        jobId: queued.jobId,
+        queueDepth: queued.queueDepth,
+        duplicate: queued.duplicate,
+        supersedes,
+        supersedePending: queued.supersedePending,
+      },
+      container: { ports, resources, healthCheck },
+      // Keys only — never values.
+      env: { count: envVars.length, keys: envVars.map((v) => v.key), inline: true },
+    },
+    finished: false,
+  });
+
+  await incrementUserDeployments(userId);
+  return serializeDeployment(updated);
+}
+
 // Pulls current state from the provider for one row. Safe to call on anything:
 // terminal rows, and rows with no provider deployment yet, come back unchanged.
 export async function syncDeployment(userId, row) {
   if (isTerminal(row.status)) return row;
   const providerRef = (row.config_snapshot ?? {}).provider ?? {};
   if (!providerRef.deploymentId) return row;
+  // Container deployments are PUSH, not pull: the worker reports progress to
+  // POST /api/v1/internal/deployments/:id/status. There is nothing to poll, and
+  // asking Vercel about a container id would 404 and wrongly mark it failed.
+  if (providerRef.type === 'container') return row;
 
   let connection;
   try {
@@ -199,6 +309,14 @@ export async function getDeploymentLogs(userId, deploymentId) {
   const row = await getOwnedDeployment(userId, deploymentId);
   const providerRef = (row.config_snapshot ?? {}).provider ?? {};
   if (!providerRef.deploymentId) return { logs: [], note: 'No provider deployment was created.' };
+  if (providerRef.type === 'container') {
+    // Build output lives with the worker; CMS only owns the queue. Streaming it
+    // back is what `deployment_logs` / the CDS service are for.
+    return {
+      logs: [],
+      note: 'Build logs for container deployments are not collected yet — the worker holds them.',
+    };
+  }
   const connection = await requireConnection(userId, 'vercel');
   return { logs: await adapterFor(connection).logs(providerRef.deploymentId) };
 }
@@ -210,6 +328,33 @@ export async function cancelDeployment(userId, deploymentId) {
     e.status = 409; e.code = 'DEPLOYMENT_TERMINAL'; throw e;
   }
   const providerRef = (row.config_snapshot ?? {}).provider ?? {};
+
+  if (providerRef.type === 'container') {
+    // A job already on the queue cannot be pulled back off it, so this marks
+    // our row cancelled and tears down the container if one exists. A worker
+    // that has already claimed the job may still finish it; the next status
+    // callback will then be ignored for a terminal row.
+    const target = await resolveTarget(userId, row.service_type);
+    let teardown = { skipped: 'no-container-id' };
+    if (row.container_id) {
+      teardown = await target.adapter.destroy({
+        containerId: row.container_id,
+        deploymentId: String(row.deployment_id),
+        serviceId: String(row.service_id),
+        projectId: row.project_id ? String(row.project_id) : null,
+        reason: 'manual',
+      }).catch((e) => ({ error: `${e.code ?? 'ERROR'}: ${e.message}` }));
+    }
+    return serializeDeployment(await patchDeployment(row.deployment_id, {
+      status: 'cancelled',
+      snapshotPatch: {
+        errorMessage: 'Cancelled from ShipYard',
+        provider: { ...providerRef, teardown },
+      },
+      finished: true,
+    }));
+  }
+
   const connection = await requireConnection(userId, 'vercel');
   if (providerRef.deploymentId) {
     await adapterFor(connection).destroy(providerRef.deploymentId);
@@ -219,4 +364,97 @@ export async function cancelDeployment(userId, deploymentId) {
     snapshotPatch: { errorMessage: 'Cancelled from ShipYard' },
     finished: true,
   }));
+}
+
+/**
+ * Queues teardown of every container a service still has running. Called when
+ * the service itself is deleted — the row goes away via ON DELETE CASCADE, so
+ * without this the container would keep running with nothing pointing at it.
+ *
+ * Best-effort and non-fatal: the user asked to delete the service, and that
+ * succeeds either way. Returns what it did so the caller can report it.
+ */
+export async function teardownServiceContainers(userId, serviceId, { projectId, serviceType }) {
+  if (targetForServiceType(serviceType)?.provider !== 'container') {
+    return { queued: 0, containers: [], skipped: 'not-a-container-service' };
+  }
+  const containers = await findServiceContainers(serviceId);
+  if (containers.length === 0) return { queued: 0, containers: [] };
+
+  const target = await resolveTarget(userId, serviceType);
+  const results = [];
+  for (const c of containers) {
+    try {
+      await target.adapter.destroy({
+        containerId: c.container_id,
+        deploymentId: String(c.deployment_id),
+        serviceId: String(serviceId),
+        projectId: projectId ? String(projectId) : null,
+        reason: 'service_deleted',
+      });
+      results.push({ containerId: c.container_id, queued: true });
+    } catch (e) {
+      results.push({ containerId: c.container_id, queued: false, error: e.code ?? 'ERROR' });
+    }
+  }
+  return { queued: results.filter((r) => r.queued).length, containers: results };
+}
+
+/**
+ * Applies a status report from the deployment worker (relayed by CMS).
+ *
+ * Service-to-service: there is no user session, so it is keyed by the shared
+ * internal secret in the route and looks the row up by id alone. A terminal row
+ * is never reopened — a late callback for a cancelled deployment is ignored.
+ */
+export async function recordWorkerStatus(deploymentId, report) {
+  const row = await getDeploymentById(deploymentId);
+  if (!row) {
+    const e = new Error('Deployment not found');
+    e.status = 404; e.code = 'NOT_FOUND'; throw e;
+  }
+  const providerRef = (row.config_snapshot ?? {}).provider ?? {};
+  if (isTerminal(row.status)) {
+    return {
+      applied: false,
+      reason: `deployment is already ${row.status}`,
+      deployment: serializeDeployment(row),
+    };
+  }
+
+  const finished = isTerminal(report.status);
+  const updated = await patchDeployment(deploymentId, {
+    status: report.status,
+    url: report.deploymentUrl ?? null,
+    containerId: report.containerId ?? null,
+    imageId: report.imageId ?? null,
+    snapshotPatch: {
+      provider: { ...providerRef, workerReportedAt: new Date().toISOString() },
+      ...(report.error ? { errorMessage: report.error } : {}),
+    },
+    finished,
+  });
+  return { applied: true, deployment: serializeDeployment(updated) };
+}
+
+/**
+ * Deletes one key from the provider project backing a service, so a variable
+ * the user just removed in ShipYard does not linger on the next deploy.
+ *
+ * The provider project id lives on the service's most recent deployment
+ * snapshot, because that is where ensureProject recorded it. A service that has
+ * never deployed has nothing to clean up. Callers treat failures as non-fatal.
+ */
+export async function removeProviderEnv(userId, serviceId, key) {
+  const { rows } = await query(
+    `SELECT config_snapshot FROM deployments
+     WHERE service_id = $1 AND config_snapshot -> 'provider' ->> 'projectId' IS NOT NULL
+     ORDER BY created_at DESC LIMIT 1`,
+    [serviceId]
+  );
+  const projectId = rows[0]?.config_snapshot?.provider?.projectId;
+  if (!projectId) return { skipped: 'never-deployed' };
+
+  const connection = await requireConnection(userId, 'vercel');
+  return adapterFor(connection).removeEnv({ projectId, key });
 }

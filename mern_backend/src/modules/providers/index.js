@@ -7,12 +7,16 @@
 //   status(providerDeploymentId) -> { status, url, readyState, errorMessage }
 //   logs(providerDeploymentId)   -> [{ at, text, level }]
 //   destroy(providerDeploymentId)-> void   (cancel in-flight work)
+//   syncEnv({ projectId, vars }) -> { created, updated, removed }
+//   removeEnv({ projectId, key })-> { removed }
 //
 // Adding `neon` / `atlas` / `homelab` means adding a factory to ADAPTERS; no
 // caller changes.
-import { decryptToken } from '../auth/crypto.js';
+import { env } from '../../config/env.js';
+import { decryptSecret } from '../../utils/crypto.js';
+import { createContainerAdapter, containerTargetConfigured } from './container.js';
 import {
-  vercelClient, mapReadyState, publicUrl, isTerminal,
+  vercelClient, mapReadyState, publicUrl, isTerminal, envTargets, envType,
 } from './vercel.js';
 
 // Our services store root_directory as '.' or '/frontend'; Vercel wants a
@@ -110,10 +114,109 @@ function createVercelAdapter({ token, teamId }) {
     async destroy(providerDeploymentId) {
       await vc.cancelDeployment(providerDeploymentId);
     },
+
+    /**
+     * Pushes ShipYard's environment variables onto the Vercel project so the
+     * build and runtime see them. Matching is by KEY: an existing entry is
+     * PATCHed in place (keeping its id, which is what the user sees in the
+     * Vercel dashboard), and if a key somehow has several entries the extras
+     * are removed so the value is unambiguous.
+     *
+     * Keys we do NOT manage are left completely alone — the user may have set
+     * variables directly in Vercel and this must not wipe them.
+     */
+    async syncEnv({ projectId, vars }) {
+      if (vars.length === 0) return { created: 0, updated: 0, removed: 0 };
+
+      const existing = await vc.listEnv(projectId);
+      const rows = Array.isArray(existing?.envs) ? existing.envs : [];
+      const byKey = new Map();
+      for (const row of rows) {
+        if (!row?.key) continue;
+        if (!byKey.has(row.key)) byKey.set(row.key, []);
+        byKey.get(row.key).push(row);
+      }
+
+      let created = 0;
+      let updated = 0;
+      let removed = 0;
+
+      for (const v of vars) {
+        const payload = {
+          key: v.key,
+          value: v.value,
+          type: envType(v.sensitive),
+          target: envTargets(v.scope),
+        };
+        const matches = byKey.get(v.key) ?? [];
+        if (matches.length === 0) {
+          await vc.createEnv(projectId, payload);
+          created += 1;
+          continue;
+        }
+        await vc.updateEnv(projectId, matches[0].id, payload);
+        updated += 1;
+        for (const extra of matches.slice(1)) {
+          await vc.deleteEnv(projectId, extra.id);
+          removed += 1;
+        }
+      }
+
+      return { created, updated, removed };
+    },
+
+    async removeEnv({ projectId, key }) {
+      const existing = await vc.listEnv(projectId);
+      const rows = Array.isArray(existing?.envs) ? existing.envs : [];
+      let removed = 0;
+      for (const row of rows.filter((r) => r?.key === key)) {
+        await vc.deleteEnv(projectId, row.id);
+        removed += 1;
+      }
+      return { removed };
+    },
   };
 }
 
 const ADAPTERS = { vercel: createVercelAdapter };
+
+/**
+ * Which target deploys which kind of service. This table is the ONLY place that
+ * maps a service_type to a provider, so callers ask here instead of branching
+ * on type themselves.
+ *
+ * `requiresConnection` distinguishes a provider the user authorises with their
+ * own credential (Vercel) from our own infrastructure (containers), which has
+ * no per-user credential at all.
+ */
+const SERVICE_TARGETS = {
+  frontend: { provider: 'vercel', requiresConnection: true },
+  backend: { provider: 'container', requiresConnection: false },
+  database: null,
+};
+
+export function targetForServiceType(serviceType) {
+  return SERVICE_TARGETS[serviceType] ?? null;
+}
+
+export function isDeployable(serviceType) {
+  return targetForServiceType(serviceType) !== null;
+}
+
+export const DEPLOYABLE_SERVICE_TYPES = Object.entries(SERVICE_TARGETS)
+  .filter(([, t]) => t !== null)
+  .map(([type]) => type);
+
+/** Builds the adapter for a target that needs no user credential. */
+export function createKeylessAdapter(providerType) {
+  if (providerType !== 'container') {
+    const e = new Error(`Provider "${providerType}" requires a connection`);
+    e.status = 400; e.code = 'CONNECTION_REQUIRED'; throw e;
+  }
+  return createContainerAdapter();
+}
+
+export { containerTargetConfigured };
 
 // `credentialsRef` is the stored ciphertext — decryption happens here so no
 // caller ever handles a plaintext provider token.
@@ -127,7 +230,32 @@ export function createAdapter({ providerType, credentialsRef, externalAccountId 
   const teamId = typeof externalAccountId === 'string' && externalAccountId.startsWith('team_')
     ? externalAccountId
     : null;
-  return factory({ token: decryptToken(credentialsRef), teamId });
+  return factory({ token: decryptSecret(credentialsRef), teamId });
 }
 
 export const SUPPORTED_PROVIDERS = Object.keys(ADAPTERS);
+
+/**
+ * Human-readable routing table for the boot log. Derived from SERVICE_TARGETS
+ * so it cannot drift from the real behaviour, and it names the specific env
+ * vars to set when a target is unavailable.
+ */
+export function SERVICE_TARGET_SUMMARY() {
+  const lines = [];
+  for (const [type, target] of Object.entries(SERVICE_TARGETS)) {
+    if (!target) {
+      lines.push(`deploy target  ${type.padEnd(9)} -> none (not deployable)`);
+      continue;
+    }
+    if (target.provider === 'container') {
+      lines.push(
+        containerTargetConfigured()
+          ? `deploy target  ${type.padEnd(9)} -> container via CMS at ${env.CMS_BASE_URL}`
+          : `deploy target  ${type.padEnd(9)} -> container (NOT CONFIGURED: set CMS_BASE_URL + CMS_INTERNAL_KEY)`
+      );
+    } else {
+      lines.push(`deploy target  ${type.padEnd(9)} -> ${target.provider} (per-user connection)`);
+    }
+  }
+  return lines;
+}

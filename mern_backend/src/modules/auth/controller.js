@@ -6,7 +6,7 @@ import { frontendUrl } from '../../config/urls.js';
 import { query } from '../../db/pool.js';
 import { SESSION_COOKIE } from '../../middleware/auth.js';
 import { asyncHandler } from '../../utils/asyncHandler.js';
-import { encryptToken, decryptToken } from './crypto.js';
+import { encryptSecret } from '../../utils/crypto.js';
 import { ID } from '../../utils/ids.js';
 import { loadGithubToken } from './tokens.js';
 import { exchangeCodeForToken, fetchGithubUser, oauthAuthorizeUrl, github } from './github.js';
@@ -91,7 +91,7 @@ export const handleGithubCallback = asyncHandler(async (req, res) => {
   res.clearCookie('gh_oauth_state', { path: '/' });
   const rawToken = await exchangeCodeForToken(String(code)); // never sent to browser
   const gh = await fetchGithubUser(rawToken);
-  const row = await upsertUser(gh, encryptToken(rawToken));
+  const row = await upsertUser(gh, encryptSecret(rawToken));
   res.cookie(SESSION_COOKIE, signSession(row.user_id), sessionCookieOptions());
   res.redirect(frontendUrl('/projects'));
 });

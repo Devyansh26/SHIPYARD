@@ -32,6 +32,9 @@ export const api = {
   // --- provider connections -------------------------------------------------
   connections: () => req('/api/v1/connections'),
   vercelConnection: () => req('/api/v1/connections/vercel'),
+  // Container target for `backend` services — no user credential, just whether
+  // the Container Management Service is configured and reachable.
+  containerTarget: () => req('/api/v1/connections/container'),
   connectVercelToken: (token: string, teamId?: string) =>
     req('/api/v1/connections/vercel/token', {
       method: 'POST',
@@ -46,6 +49,21 @@ export const api = {
   deployment: (id: string) => req(`/api/v1/deployments/${id}`),
   deploymentLogs: (id: string) => req(`/api/v1/deployments/${id}/logs`),
   cancelDeployment: (id: string) => req(`/api/v1/deployments/${id}/cancel`, { method: 'POST' }),
+
+  // --- environment variables ------------------------------------------------
+  // Values are encrypted server-side; list responses are masked, so plaintext
+  // only ever arrives from revealEnvVar().
+  envVars: (pid: string, sid: string) => req(`/api/v1/projects/${pid}/services/${sid}/env`),
+  createEnvVar: (pid: string, sid: string, data: unknown) =>
+    req(`/api/v1/projects/${pid}/services/${sid}/env`, { method: 'POST', body: JSON.stringify(data) }),
+  importEnvVars: (pid: string, sid: string, data: unknown) =>
+    req(`/api/v1/projects/${pid}/services/${sid}/env/import`, { method: 'POST', body: JSON.stringify(data) }),
+  revealEnvVar: (pid: string, sid: string, varId: string) =>
+    req(`/api/v1/projects/${pid}/services/${sid}/env/${varId}/reveal`),
+  updateEnvVar: (pid: string, sid: string, varId: string, data: unknown) =>
+    req(`/api/v1/projects/${pid}/services/${sid}/env/${varId}`, { method: 'PATCH', body: JSON.stringify(data) }),
+  deleteEnvVar: (pid: string, sid: string, varId: string) =>
+    req(`/api/v1/projects/${pid}/services/${sid}/env/${varId}`, { method: 'DELETE' }),
 };
 
 // OAuth endpoints are browser redirects, not fetches.

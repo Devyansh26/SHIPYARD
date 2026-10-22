@@ -6,8 +6,8 @@
   "type": "module",
   "main": "src/server.js",
   "scripts": {
-    "dev": "node src/server.js",
-    "dev:watch": "node --watch src/server.js",
+    "dev": "node --watch src/server.js",
+    "dev:once": "node src/server.js",
     "start": "node src/server.js"
   },
   "dependencies": {

@@ -242,9 +242,14 @@ function Canvas({ user, onLogout }: { user: User; onLogout: () => void }) {
           repository: repository || 'owner/repo',
           branch: 'main',
           rootDirectory: '.',
+          // Seed the provider key for this type so the Settings tab opens with
+          // sensible defaults rather than blank required fields.
           serviceConfig: {
             canvas: position,
             ...(type === 'frontend' ? { vercel: { framework: 'vite' } } : {}),
+            ...(type === 'backend'
+              ? { container: { ports: [{ containerPort: 3000, hostPort: null, protocol: 'tcp' }] } }
+              : {}),
             ...(type === 'database' ? { engine: 'postgres' } : {}),
           },
         })

@@ -1,40 +1,17 @@
-import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useState, type ReactNode } from 'react'
 import { api, OAUTH } from '../api'
 import { usePoll } from '../lib/hooks'
 import {
   errCode, errMessage,
-  type Connection, type Deployment, type Service, type VercelMeta,
+  type Connection, type ContainerTarget, type Deployment, type Service,
 } from '../lib/types'
 import { Button, Field, Spinner, StatusBadge } from '../components/ui'
-import { CloseIcon, ExternalIcon, GithubMark, TrashIcon, TYPE_ICON, VercelMark } from '../components/icons'
+import { CloseIcon, ExternalIcon, GithubMark, TYPE_ICON, VercelMark } from '../components/icons'
 import { TYPE_META, inputCls } from '../lib/meta'
+import EnvVarsTab from './EnvVarsTab'
+import SettingsTab from './SettingsTab'
 
-const FRAMEWORKS = [
-  { value: '', label: 'Auto-detect / other' },
-  { value: 'vite', label: 'Vite' },
-  { value: 'nextjs', label: 'Next.js' },
-  { value: 'create-react-app', label: 'Create React App' },
-  { value: 'remix', label: 'Remix' },
-  { value: 'nuxtjs', label: 'Nuxt' },
-  { value: 'svelte', label: 'SvelteKit' },
-  { value: 'astro', label: 'Astro' },
-]
-
-const DB_ENGINES = ['postgres', 'mongodb']
-
-/** `services.repository` is stored as owner/repo but may hold a URL. */
-function splitRepo(repository: string | null): { owner: string; repo: string } | null {
-  const cleaned = String(repository ?? '')
-    .trim()
-    .replace(/^git@github\.com:/, '')
-    .replace(/^https?:\/\/(www\.)?github\.com\//, '')
-    .replace(/\.git$/, '')
-    .replace(/^\/+|\/+$/g, '')
-  const parts = cleaned.split('/').filter(Boolean)
-  return parts.length >= 2 ? { owner: parts[0], repo: parts[1] } : null
-}
-
-type Tab = 'settings' | 'deploy' | 'connection'
+type Tab = 'settings' | 'env' | 'deploy' | 'connection'
 
 type Props = {
   projectId: string
@@ -118,13 +95,14 @@ function PanelBody({
       <nav className="flex gap-0.5 border-b border-line px-2 pt-1.5">
         {([
           ['settings', 'Settings'],
+          ['env', 'Variables'],
           ['deploy', meta.deployable ? 'Deploy' : 'Provision'],
           ['connection', 'Connection'],
         ] as const).map(([key, label]) => (
           <button
             key={key}
             onClick={() => setTab(key)}
-            className={`-mb-px rounded-t-lg border-b-2 px-3 py-2 text-[13px] font-medium transition ${
+            className={`-mb-px shrink-0 rounded-t-lg border-b-2 px-2.5 py-2 text-[12.5px] font-medium transition ${
               tab === key ? 'border-ink text-ink' : 'border-transparent text-faint hover:text-muted'
             }`}
           >
@@ -137,6 +115,7 @@ function PanelBody({
         {tab === 'settings' && (
           <SettingsTab projectId={projectId} service={service} onSaved={onSaved} onDeleted={onDeleted} />
         )}
+        {tab === 'env' && <EnvVarsTab projectId={projectId} serviceId={service.id} />}
         {tab === 'deploy' && (
           <DeployTab
             projectId={projectId}
@@ -145,192 +124,13 @@ function PanelBody({
             onNeedConnection={() => setTab('connection')}
           />
         )}
-        {tab === 'connection' && <ConnectionTab />}
+        {tab === 'connection' && (
+          meta.deployable && service.serviceType === 'backend'
+            ? <ContainerTargetTab />
+            : <ConnectionTab />
+        )}
       </div>
     </>
-  )
-}
-
-/* ------------------------------------------------------------------ settings */
-
-function SettingsTab({
-  projectId, service, onSaved, onDeleted,
-}: { projectId: string; service: Service; onSaved: (s: Service) => void; onDeleted: (id: string) => void }) {
-  const vercel: VercelMeta = service.serviceConfig?.vercel ?? {}
-  const isDb = service.serviceType === 'database'
-
-  const [form, setForm] = useState({
-    name: service.name,
-    repository: service.repository ?? '',
-    branch: service.branch ?? 'main',
-    rootDirectory: service.rootDirectory ?? '.',
-    installCommand: vercel.installCommand ?? '',
-    buildCommand: service.buildCommand ?? '',
-    outputDirectory: vercel.outputDirectory ?? '',
-    startCommand: service.startCommand ?? '',
-    framework: vercel.framework ?? '',
-    engine: String((service.serviceConfig as Record<string, unknown>)?.engine ?? 'postgres'),
-  })
-  const [branches, setBranches] = useState<string[]>([])
-  const [saving, setSaving] = useState(false)
-  const [error, setError] = useState<string | null>(null)
-  const [saved, setSaved] = useState(false)
-
-  const repo = useMemo(() => splitRepo(form.repository), [form.repository])
-
-  useEffect(() => {
-    if (!repo) { setBranches([]); return }
-    let alive = true
-    api.branches(repo.owner, repo.repo)
-      .then((r) => { if (alive) setBranches((r.data ?? []).map((b: { name: string }) => b.name)) })
-      .catch(() => { if (alive) setBranches([]) })
-    return () => { alive = false }
-  }, [repo])
-
-  const set = (k: keyof typeof form) => (v: string) => {
-    setForm((f) => ({ ...f, [k]: v }))
-    setSaved(false)
-  }
-
-  async function save() {
-    setError(null)
-    setSaving(true)
-    try {
-      // serviceConfig is replaced wholesale by PATCH, so merge the existing
-      // object client-side and keep the canvas layout intact.
-      const serviceConfig: Record<string, unknown> = {
-        ...(service.serviceConfig ?? {}),
-        ...(isDb ? { engine: form.engine } : {}),
-      }
-      if (!isDb) {
-        serviceConfig.vercel = {
-          ...vercel,
-          framework: form.framework || null,
-          outputDirectory: form.outputDirectory || null,
-          installCommand: form.installCommand || null,
-        }
-      }
-      const r = await api.updateService(projectId, service.id, {
-        name: form.name.trim(),
-        repository: form.repository.trim(),
-        branch: form.branch.trim() || 'main',
-        rootDirectory: form.rootDirectory.trim() || '.',
-        buildCommand: form.buildCommand.trim() || null,
-        startCommand: form.startCommand.trim() || null,
-        serviceConfig,
-      })
-      onSaved(r.service as Service)
-      setSaved(true)
-    } catch (e) {
-      setError(
-        errCode(e) === 'SERVICE_NAME_CONFLICT'
-          ? 'Another service in this project already has that name.'
-          : errMessage(e, 'Could not save'),
-      )
-    } finally {
-      setSaving(false)
-    }
-  }
-
-  async function remove() {
-    if (!window.confirm(`Delete "${service.name}"? This removes the node and its deployment history.`)) return
-    try {
-      await api.deleteService(projectId, service.id)
-      onDeleted(service.id)
-    } catch (e) {
-      setError(errMessage(e, 'Could not delete this service'))
-    }
-  }
-
-  return (
-    <div className="space-y-6">
-      <Section title="Resource">
-        <Field label="Name">
-          <input className={inputCls} value={form.name} onChange={(e) => set('name')(e.target.value)} />
-        </Field>
-        <Field label="Service ID">
-          <code className="block truncate rounded-lg border border-line bg-sunken px-2.5 py-1.5 font-mono text-[11px] text-faint">
-            {service.id}
-          </code>
-        </Field>
-        <p className="text-[11px] leading-snug text-faint">
-          Type is <span className="font-medium text-muted">{TYPE_META[service.serviceType].label}</span> and
-          cannot be changed after creation.
-        </p>
-      </Section>
-
-      {isDb ? (
-        <Section title="Engine">
-          <Field
-            label="Database engine"
-            hint="Stored in service_config.engine. Provisioning adapters (Neon, Atlas) are not wired up yet — this records your intent."
-          >
-            <select className={inputCls} value={form.engine} onChange={(e) => set('engine')(e.target.value)}>
-              {DB_ENGINES.map((x) => <option key={x} value={x}>{x}</option>)}
-            </select>
-          </Field>
-        </Section>
-      ) : (
-        <>
-          <Section title="Source">
-            <Field label="Repository" hint="owner/repo, or a full GitHub URL.">
-              <input className={inputCls} value={form.repository} onChange={(e) => set('repository')(e.target.value)} />
-            </Field>
-            <Field label="Branch">
-              {branches.length > 0 ? (
-                <select className={inputCls} value={form.branch} onChange={(e) => set('branch')(e.target.value)}>
-                  {!branches.includes(form.branch) && <option value={form.branch}>{form.branch}</option>}
-                  {branches.map((b) => <option key={b} value={b}>{b}</option>)}
-                </select>
-              ) : (
-                <input className={inputCls} value={form.branch} onChange={(e) => set('branch')(e.target.value)} />
-              )}
-            </Field>
-            <Field label="Root directory" hint="Use . for the repo root, or a subfolder like apps/web for a monorepo.">
-              <input className={inputCls} value={form.rootDirectory} onChange={(e) => set('rootDirectory')(e.target.value)} />
-            </Field>
-          </Section>
-
-          <Section title="Build">
-            <Field
-              label="Framework preset"
-              hint="A preset lets Vercel infer build and output settings. Choose auto-detect to rely on the fields below."
-            >
-              <select className={inputCls} value={form.framework} onChange={(e) => set('framework')(e.target.value)}>
-                {FRAMEWORKS.map((f) => <option key={f.value} value={f.value}>{f.label}</option>)}
-              </select>
-            </Field>
-            <Field label="Install command">
-              <input className={inputCls} placeholder="npm install" value={form.installCommand} onChange={(e) => set('installCommand')(e.target.value)} />
-            </Field>
-            <Field label="Build command">
-              <input className={inputCls} placeholder="npm run build" value={form.buildCommand} onChange={(e) => set('buildCommand')(e.target.value)} />
-            </Field>
-            <Field label="Output directory" hint="dist for Vite, .next for Next.js. Empty uses the preset default.">
-              <input className={inputCls} placeholder="dist" value={form.outputDirectory} onChange={(e) => set('outputDirectory')(e.target.value)} />
-            </Field>
-            <Field label="Start command" hint="Recorded for self-hosted targets; Vercel does not use it for static builds.">
-              <input className={inputCls} placeholder="node server.js" value={form.startCommand} onChange={(e) => set('startCommand')(e.target.value)} />
-            </Field>
-          </Section>
-        </>
-      )}
-
-      {error && <p className="rounded-lg bg-danger-soft px-3 py-2 text-xs text-danger">{error}</p>}
-
-      <div className="flex items-center gap-2 border-t border-line pt-4">
-        <Button onClick={save} disabled={saving || form.name.trim().length < 2}>
-          {saving ? <><Spinner /> Saving…</> : saved ? 'Saved' : 'Save changes'}
-        </Button>
-        <button
-          onClick={remove}
-          title="Delete service"
-          className="ml-auto grid size-8 place-items-center rounded-lg border border-line text-faint transition hover:border-danger/40 hover:bg-danger-soft hover:text-danger"
-        >
-          <TrashIcon />
-        </button>
-      </div>
-    </div>
   )
 }
 
@@ -429,7 +229,11 @@ function DeployTab({
 
       <p className="text-[11px] leading-relaxed text-faint">
         Deploys <code className="font-mono text-muted">{service.branch ?? 'main'}</code> at its latest
-        commit. The Vercel project is created in your own account.
+        commit.{' '}
+        {service.serviceType === 'backend'
+          ? 'The job is queued for your container host; a redeploy only replaces the running '
+            + 'container once the new one is healthy.'
+          : 'The Vercel project is created in your own account.'}
       </p>
 
       {error && <p className="rounded-lg bg-danger-soft px-3 py-2 text-xs text-danger">{error}</p>}
@@ -508,7 +312,90 @@ function DeployTab({
   )
 }
 
-/* ---------------------------------------------------------------- connection */
+/* ------------------------------------------------- connection: container host */
+
+/**
+ * Backend services deploy to our own container host, so there is no account to
+ * connect — only whether the Container Management Service is configured and
+ * answering. Showing the Vercel panel here would be actively misleading.
+ */
+function ContainerTargetTab() {
+  const [target, setTarget] = useState<ContainerTarget | null>(null)
+  const [notConfigured, setNotConfigured] = useState<string | null>(null)
+  const [loading, setLoading] = useState(true)
+
+  const load = useCallback(async () => {
+    setLoading(true)
+    try {
+      const r = await api.containerTarget()
+      setTarget(r.target as ContainerTarget)
+      setNotConfigured(null)
+    } catch (e) {
+      setTarget(null)
+      setNotConfigured(errMessage(e, 'Could not reach the control plane'))
+    } finally {
+      setLoading(false)
+    }
+  }, [])
+
+  useEffect(() => { void load() }, [load])
+
+  if (loading) {
+    return <div className="flex items-center gap-2 py-6 text-xs text-faint"><Spinner /> Checking…</div>
+  }
+
+  return (
+    <div className="space-y-6">
+      <Section title="Container host">
+        {notConfigured ? (
+          <div className="rounded-xl border border-danger/30 bg-danger-soft p-3.5">
+            <p className="text-[13px] font-semibold text-danger">Not configured</p>
+            <p className="mt-1.5 text-[12px] leading-relaxed text-danger">{notConfigured}</p>
+          </div>
+        ) : (
+          <div className="rounded-xl border border-line bg-sunken p-3.5">
+            <div className="flex items-center gap-2">
+              <span className={`size-2 rounded-full ${target?.reachable ? 'bg-ink' : 'bg-danger'}`} />
+              <span className="text-[13px] font-semibold text-ink">
+                {target?.reachable ? 'Connected' : 'Unreachable'}
+              </span>
+              <span className="ml-auto rounded border border-line px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-faint">
+                self-hosted
+              </span>
+            </div>
+            {target?.reachable ? (
+              <p className="mt-2 text-[11px] leading-relaxed text-faint">
+                Deployments are queued for your own container host — no third-party
+                account and no per-user token. Nothing to connect here.
+              </p>
+            ) : (
+              <p className="mt-2 text-[11px] leading-relaxed text-danger">
+                {target?.error?.message ?? 'The container management service did not respond.'}
+              </p>
+            )}
+            <div className="mt-3">
+              <Button variant="ghost" size="sm" onClick={() => void load()}>Re-check</Button>
+            </div>
+          </div>
+        )}
+      </Section>
+
+      <Section title="GitHub">
+        <div className="flex items-start gap-2.5 rounded-xl border border-line bg-sunken p-3.5">
+          <span className="mt-0.5 shrink-0 text-muted"><GithubMark /></span>
+          <p className="text-[11px] leading-relaxed text-faint">
+            Connected via sign-in. Used to list branches and resolve the commit to
+            build. The build itself clones the repository on the container host,
+            so a <strong className="font-medium text-muted">private</strong> repo
+            needs credentials there — not wired up yet.
+          </p>
+        </div>
+      </Section>
+    </div>
+  )
+}
+
+/* ------------------------------------------------------ connection: Vercel */
 
 function ConnectionTab() {
   const [connection, setConnection] = useState<Connection | null>(null)

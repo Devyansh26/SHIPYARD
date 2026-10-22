@@ -83,6 +83,24 @@ export function ExternalIcon({ size = 13, className }: IconProps) {
   )
 }
 
+export function EyeIcon({ size = 14, className }: IconProps) {
+  return (
+    <svg {...base(size, className)}>
+      <path d="M2.5 12S6 5.5 12 5.5 21.5 12 21.5 12S18 18.5 12 18.5 2.5 12 2.5 12Z" />
+      <circle cx="12" cy="12" r="2.75" />
+    </svg>
+  )
+}
+
+export function EyeOffIcon({ size = 14, className }: IconProps) {
+  return (
+    <svg {...base(size, className)}>
+      <path d="M9.9 5.9A8.5 8.5 0 0 1 12 5.5c6 0 9.5 6.5 9.5 6.5a17 17 0 0 1-2.2 3.1M6.4 7.4A17 17 0 0 0 2.5 12S6 18.5 12 18.5c.9 0 1.7-.1 2.5-.4" />
+      <path d="M3 3l18 18" />
+    </svg>
+  )
+}
+
 export function TrashIcon({ size = 15, className }: IconProps) {
   return (
     <svg {...base(size, className)}>

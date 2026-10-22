@@ -6,8 +6,10 @@ import { frontendUrl } from '../../config/urls.js';
 import { requireAuth } from '../../middleware/auth.js';
 import { validate } from '../../middleware/validate.js';
 import { asyncHandler } from '../../utils/asyncHandler.js';
-import { encryptToken } from '../auth/crypto.js';
-import { createAdapter, SUPPORTED_PROVIDERS } from '../providers/index.js';
+import { encryptSecret } from '../../utils/crypto.js';
+import {
+  createAdapter, createKeylessAdapter, containerTargetConfigured, SUPPORTED_PROVIDERS,
+} from '../providers/index.js';
 import { listConnections, upsertConnection, revokeConnection, findConnection } from './repository.js';
 
 const STATE_COOKIE = 'vercel_oauth_state';
@@ -51,7 +53,7 @@ async function exchangeVercelCode(code) {
 // Confirms the token works before it is stored, and resolves which Vercel
 // account (personal or team) it acts as.
 async function verifyAndStore(userId, rawToken, teamId) {
-  const credentialsRef = encryptToken(rawToken);
+  const credentialsRef = encryptSecret(rawToken);
   const adapter = createAdapter({
     providerType: 'vercel',
     credentialsRef,
@@ -124,6 +126,37 @@ router.get('/vercel', requireAuth, asyncHandler(async (req, res) => {
     externalAccountId: row.external_account_id,
   });
   res.json({ connection: { id: String(row.connection_id), ...(await adapter.verify()) } });
+}));
+
+/**
+ * Status of the container target (`backend` services). There is no per-user
+ * credential here — this is our own infrastructure — so it reports whether the
+ * Container Management Service is configured and reachable, which is what the
+ * panel needs to show instead of a Vercel account.
+ */
+router.get('/container', requireAuth, asyncHandler(async (_req, res) => {
+  if (!containerTargetConfigured()) {
+    return res.status(501).json({
+      error: {
+        code: 'CONTAINER_TARGET_NOT_CONFIGURED',
+        message: 'Set CMS_BASE_URL and CMS_INTERNAL_KEY in mern_backend/.env, and run '
+          + 'container_management/, to deploy backend services.',
+      },
+    });
+  }
+  try {
+    const identity = await createKeylessAdapter('container').verify();
+    res.json({ target: { type: 'container', reachable: true, ...identity } });
+  } catch (e) {
+    // Reachability is information, not a failure of this request.
+    res.json({
+      target: {
+        type: 'container',
+        reachable: false,
+        error: { code: e.code ?? 'ERROR', message: e.message },
+      },
+    });
+  }
 }));
 
 router.delete('/vercel', requireAuth, asyncHandler(async (req, res) => {

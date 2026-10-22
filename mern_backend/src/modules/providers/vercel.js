@@ -78,7 +78,36 @@ export function vercelClient({ token, teamId = null }) {
       call('PATCH', `/v12/deployments/${encodeURIComponent(id)}/cancel`, { context: 'deployment cancel' }),
     deploymentEvents: (id, limit) =>
       call('GET', `/v2/deployments/${encodeURIComponent(id)}/events`, { query: { limit, builds: '1' }, context: 'build logs' }),
+
+    // --- project environment variables ---
+    listEnv: (project) =>
+      call('GET', `/v9/projects/${encodeURIComponent(project)}/env`, { context: 'env listing' }),
+    createEnv: (project, payload) =>
+      call('POST', `/v10/projects/${encodeURIComponent(project)}/env`, { body: payload, query: { upsert: 'true' }, context: 'env create' }),
+    updateEnv: (project, envId, payload) =>
+      call('PATCH', `/v9/projects/${encodeURIComponent(project)}/env/${encodeURIComponent(envId)}`, { body: payload, context: 'env update' }),
+    deleteEnv: (project, envId) =>
+      call('DELETE', `/v9/projects/${encodeURIComponent(project)}/env/${encodeURIComponent(envId)}`, { context: 'env delete' }),
   };
+}
+
+// environment_vars.scope -> Vercel's `target` array. 'all' includes
+// development so `vercel dev` and preview branches see the value too.
+const TARGETS = {
+  all: ['production', 'preview', 'development'],
+  production: ['production'],
+  preview: ['preview'],
+};
+
+export function envTargets(scope) {
+  return TARGETS[scope] ?? TARGETS.all;
+}
+
+// 'encrypted' is Vercel's at-rest-encrypted type and is still readable back by
+// the account owner; 'sensitive' would be write-only, which breaks their own
+// dashboard editing. Non-secrets go in as 'plain' so they stay readable.
+export function envType(sensitive) {
+  return sensitive ? 'encrypted' : 'plain';
 }
 
 // --- state machine -----------------------------------------------------------

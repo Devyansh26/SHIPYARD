@@ -18,6 +18,14 @@ const envSchema = z.object({
   VERCEL_CLIENT_SECRET: z.string().min(1).optional(),
   VERCEL_INTEGRATION_SLUG: z.string().min(1).optional(),
   VERCEL_REDIRECT_URI: z.string().url().optional(),
+  // Container Management Service — the target for `backend` services. Optional
+  // so the control plane still boots without it; a backend deploy then fails
+  // with 501 CONTAINER_TARGET_NOT_CONFIGURED instead of at startup.
+  CMS_BASE_URL: z.string().url().optional(),
+  CMS_INTERNAL_KEY: z.string().min(16).optional(),
+  // Shared secret for inbound service-to-service calls (the deployment status
+  // webhook). Defaults to CMS_INTERNAL_KEY so one value configures both legs.
+  INTERNAL_API_KEY: z.string().min(16).optional(),
 });
 
 export const env = envSchema.parse(process.env);
@@ -26,3 +34,6 @@ export const isProd = env.NODE_ENV === 'production';
 export const vercelOAuthConfigured = Boolean(
   env.VERCEL_CLIENT_ID && env.VERCEL_CLIENT_SECRET && env.VERCEL_INTEGRATION_SLUG && env.VERCEL_REDIRECT_URI
 );
+
+// One secret can serve both directions of the control-plane <-> CMS link.
+export const internalApiKey = env.INTERNAL_API_KEY ?? env.CMS_INTERNAL_KEY ?? null;

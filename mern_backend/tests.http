@@ -142,3 +142,30 @@ GET {{base}}/deployments/{{deploymentId}}/logs
 
 ### Cancel an in-flight deployment (409 if already terminal)
 POST {{base}}/deployments/{{deploymentId}}/cancel
+
+### ----------------------------------------------- internal (service-to-service)
+### No session — authenticated with the shared internal key instead.
+@internalKey = replace_with_INTERNAL_API_KEY
+
+### The worker reports a container deployment's outcome.
+### This is what moves the row off `queued` and records container_id, which a
+### later redeploy needs in order to supersede it.
+POST {{base}}/internal/deployments/{{deploymentId}}/status
+Content-Type: application/json
+X-Internal-Key: {{internalKey}}
+
+{ "status": "healthy", "containerId": "ctr_abc123", "imageId": "img_abc123", "deploymentUrl": "http://10.0.0.5:8000" }
+
+### A failed build (leaves any superseded container running)
+POST {{base}}/internal/deployments/{{deploymentId}}/status
+Content-Type: application/json
+X-Internal-Key: {{internalKey}}
+
+{ "status": "failed", "error": "build exited 1" }
+
+### Wrong key -> 403
+POST {{base}}/internal/deployments/{{deploymentId}}/status
+Content-Type: application/json
+X-Internal-Key: nope
+
+{ "status": "healthy" }

@@ -1,4 +1,4 @@
-# ShipYard control plane (auth + projects + services + Vercel deployments)
+# ShipYard control plane (auth + projects + services + env vars + deployments)
 
 Express backend in `mern_backend/`, minimal Vite+React test UI in `frontend/`.
 
@@ -66,6 +66,16 @@ are unset), `GET /connections/vercel/callback`, `POST /connections/vercel/token`
 `DELETE /connections/vercel` (marks the row `revoked`, never deletes it, so
 `services.provider_connection_id` keeps pointing at who deployed what).
 
+Environment variables: `GET|POST /projects/:projectId/services/:serviceId/env`,
+`POST .../env/import` `{ content, sensitive?, scope? }` (paste a .env),
+`GET .../env/:varId/reveal` (the only endpoint that returns plaintext),
+`PATCH|DELETE .../env/:varId`.
+
+Internal (service-to-service, `X-Internal-Key`, no session):
+`POST /internal/deployments/:deploymentId/status` — the deployment worker (or
+CMS relaying for it) reports `{ status, containerId?, imageId?, deploymentUrl?,
+error? }`. A terminal deployment is never reopened.
+
 Deployments: `POST|GET /projects/:projectId/services/:serviceId/deployments`
 (POST body `{ branch?, target? }`, `target` = `production` | `preview`),
 `GET /deployments/:deploymentId`, `GET /deployments/:deploymentId/logs`,
@@ -76,6 +86,9 @@ Ops: `GET /health`, `GET /ready`.
 Errors: `{ error: { code, message } }`. Unknown project/service → 404 (never 403).
 The GitHub token is AES-256-GCM encrypted into `users.user_github.access_token_ref`
 and never sent to the browser (`toCamelUser` strips that key from every response).
+`src/utils/crypto.js` (`encryptSecret`/`decryptSecret`) is the one encryption
+primitive behind all three secret stores: GitHub tokens, provider credentials
+and environment variable values.
 `provider_connections` is **not** used for GitHub — its `provider_type` CHECK
 only allows `vercel, neon, atlas, homelab`, i.e. deployment targets.
 
@@ -136,6 +149,70 @@ Vercel-specific build settings live under `service_config.vercel`:
 `framework` is a Vercel preset slug (`vite`, `nextjs`, …) or null for
 auto-detect — with null, Vercel's "Other" defaults apply, so a Vite app needs
 either `framework: "vite"` or `outputDirectory: "dist"`.
+
+## Two deployment targets
+
+`service_type` decides where a service goes. The mapping lives in
+`SERVICE_TARGETS` in `src/modules/providers/index.js`:
+
+| service_type | target | credential |
+|---|---|---|
+| `frontend` | Vercel REST API, inline | the user's Vercel token |
+| `backend` | Container Management Service → Redis queue → worker | none (shared `X-Internal-Key`) |
+| `database` | not deployable | — |
+
+### Backend services: queued, not deployed
+
+A backend deploy posts the job to CMS (`container_management/`), which pushes it
+onto `deployments:queue`. The row is created as `queued`; an external worker
+builds and runs the container and reports back to
+`POST /internal/deployments/:id/status`, which records `container_id` and
+`image_id`. Requires `CMS_BASE_URL` + `CMS_INTERNAL_KEY`, otherwise a backend
+deploy returns 501 `CONTAINER_TARGET_NOT_CONFIGURED`.
+
+The job contract is built by `buildDeploymentJob` in
+`src/modules/providers/container.js`; `container_management/README.md` documents
+it for whoever writes the worker. Ports, resources and the health check come
+from `service_config.container` (defaults: one port on 3000).
+
+**Redeploying something already running** is a create-then-delete cutover: the
+job carries `supersedes: { deployment_id, container_id }` for the running
+container, and CMS enqueues the teardown of the old one **only** after the new
+deployment reports healthy. A failed build leaves the old container running.
+
+**Deleting a backend service** queues a teardown of its containers first (the
+deployment rows, and so the container ids, are about to be cascaded away), then
+deletes the row. `DELETE .../services/:id` therefore returns 200 with
+`{ deleted, teardown }` rather than 204.
+
+Env vars are **decrypted into the job payload** rather than synced to a
+provider, so the queue contains plaintext secrets — use a private, TLS Redis.
+
+## Environment variables
+
+Stored as rows in `environment_vars`, one per key, with the value encrypted
+(`secret_ref` = `enc:v1:<iv>:<tag>:<ciphertext>`). Nothing writes plaintext to
+that column.
+
+- **Responses are masked.** A list returns `valueLength` always and
+  `valuePreview` only for non-sensitive vars. `GET .../env/:varId/reveal` is the
+  single endpoint that decrypts; it is rate-limited and sends
+  `Cache-Control: no-store`.
+- `sensitive` defaults to true. `scope` is `production | preview | all` per the
+  column CHECK.
+- `POST .../env/import` parses a pasted `.env` and **upserts values only** —
+  an existing key keeps the `sensitive`/`scope` the user chose. The response
+  reports `created`, `updated`, and `skipped` (with the reason each line was
+  rejected).
+- `(service_id, key)` is UNIQUE → 409 `ENV_KEY_CONFLICT`.
+
+At deploy time `triggerDeployment` decrypts them and pushes them to the Vercel
+project **before** starting the build, since Vercel snapshots project env when a
+build begins. So **editing a variable does not redeploy** — the new value
+applies to the next deployment. Keys set directly in Vercel that ShipYard does
+not manage are never touched. Deleting a variable also removes it from the
+Vercel project (best-effort). `config_snapshot.env` records the keys that were
+injected, never the values.
 
 ## Canvas layout
 
