@@ -339,6 +339,9 @@ export default function SettingsTab({
               <Field label="Output directory" hint="dist for Vite, .next for Next.js. Empty uses the preset default.">
                 <input className={inputCls} placeholder="dist" value={form.outputDirectory} onChange={(e) => set('outputDirectory')(e.target.value)} />
               </Field>
+              <Field label="Start command" hint="The long-running process. Required unless your repository has a Dockerfile with its own CMD.">
+                <input className={inputCls} placeholder="npm run start" value={form.startCommand} onChange={(e) => set('startCommand')(e.target.value)} />
+              </Field>
             </Section>
           ) : (
             <BackendFields
