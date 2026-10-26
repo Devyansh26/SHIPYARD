@@ -124,7 +124,7 @@ async def test_recover_stuck_jobs(worker, mock_redis, sample_payload):
     mock_redis.rpush.assert_awaited_once_with("test:deployments:queue", json.dumps(sample_payload))
 
 @pytest.mark.asyncio
-async def test_start_loop_handles_timeout_silently(worker, mock_redis):
+async def test_start_loop_handles_timeout_silently(worker, mock_redis, settings):
     # Simulate a TimeoutError on the first poll, then cancel
     worker.recover_stuck_jobs = AsyncMock()
     call_count = 0
@@ -142,4 +142,6 @@ async def test_start_loop_handles_timeout_silently(worker, mock_redis):
 
     assert call_count >= 1
     assert worker.is_running is False
+    # The poll timeout must come from settings, not a hardcoded 5s
+    assert mock_redis.blpop.call_args.kwargs.get("timeout") == settings.QUEUE_POLL_TIMEOUT_SECONDS
 

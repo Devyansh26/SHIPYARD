@@ -30,10 +30,16 @@ class DeploymentWorker:
         await self.recover_stuck_jobs()
         logger.info(f"Listening on queue '{self.settings.QUEUE_NAME}'...")
 
+        poll_timeout = self.settings.QUEUE_POLL_TIMEOUT_SECONDS
+        consecutive_failures = 0
+
         while self.is_running:
             try:
-                # BLPOP with 5s timeout to allow clean shutdown check
-                item = await self.redis.blpop(self.settings.QUEUE_NAME, timeout=5)
+                # Blocking poll; raises `poll_timeout` so shutdown checks are
+                # responsive while keeping the billed-command rate low for
+                # metered providers like Upstash.
+                item = await self.redis.blpop(self.settings.QUEUE_NAME, timeout=poll_timeout)
+                consecutive_failures = 0
                 if not item:
                     continue
 
@@ -46,10 +52,20 @@ class DeploymentWorker:
                 await self.handle_job(payload_str)
             except (TimeoutError, aioredis.TimeoutError):
                 # Normal idle timeout waiting for queue items; continue listening
+                consecutive_failures = 0
                 continue
             except asyncio.CancelledError:
                 logger.info("Worker cancelled, exiting loop.")
                 break
+            except (aioredis.ConnectionError, aioredis.RedisError) as e:
+                # Remote/managed providers flake; back off instead of hot-looping.
+                consecutive_failures += 1
+                backoff = min(2 ** consecutive_failures, 60)
+                logger.error(
+                    f"Redis error in worker loop (failure {consecutive_failures}), "
+                    f"retrying in {backoff}s: {e}"
+                )
+                await asyncio.sleep(backoff)
             except Exception as e:
                 logger.error(f"Unexpected worker error: {e}", exc_info=True)
                 await asyncio.sleep(1)

@@ -26,9 +26,11 @@ class ServiceConfigSnapshot(BaseModel):
     build_command: Optional[str] = None
     pre_deploy_command: Optional[str] = None
     start_command: Optional[str] = None
-    env_vars: List[Dict[str, Any]] = Field(default_factory=list)  # [{"key": "...", "secret_ref": "..."}]
-    ports: List[Dict[str, Any]] = Field(default_factory=list)
-    resources: Dict[str, Any] = Field(default_factory=dict)
+    # Optional because upstream backends legitimately send `null` for unset
+    # fields. Downstream consumers use `or <default>` fallbacks.
+    env_vars: Optional[List[Dict[str, Any]]] = Field(default_factory=list)  # [{"key": "...", "secret_ref": "..."}]
+    ports: Optional[List[Dict[str, Any]]] = Field(default_factory=list)
+    resources: Optional[Dict[str, Any]] = Field(default_factory=dict)
     health_check: Optional[Dict[str, Any]] = None
 
 class DeploymentJob(BaseModel):

@@ -57,7 +57,23 @@ def get_redis() -> aioredis.Redis:
     global _redis_client
     if _redis_client is None:
         settings = get_settings()
-        _redis_client = aioredis.from_url(settings.REDIS_URL, decode_responses=False)
+        is_tls = settings.REDIS_URL.startswith("rediss://")
+        kwargs: dict = {"decode_responses": False}
+
+        if is_tls:
+            # Remote TLS providers (e.g. Upstash): guard against indefinite
+            # socket hangs. Must exceed the BLPOP idle timeout (poll seconds)
+            # plus network slack, otherwise every idle poll surfaces as a
+            # local socket read timeout instead of a graceful None.
+            kwargs["socket_connect_timeout"] = 10
+            kwargs["socket_timeout"] = max(settings.QUEUE_POLL_TIMEOUT_SECONDS + 10, 15)
+            kwargs["health_check_interval"] = 60
+            kwargs["retry_on_timeout"] = True
+
+        _redis_client = aioredis.from_url(
+            settings.REDIS_URL,
+            **kwargs
+        )
     return _redis_client
 
 def get_image_builder() -> ImageBuilder:

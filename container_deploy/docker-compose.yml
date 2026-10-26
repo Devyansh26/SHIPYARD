@@ -1,0 +1,36 @@
+# Runs container_deploy itself as a container, against the host Docker daemon.
+#
+#   docker compose up -d --build
+#   docker compose logs -f deployer
+#
+# network_mode: host is deliberate (two reasons):
+#   1. After `docker run`, the deployer opens a TCP socket to the *container IP*
+#      to verify the app really serves traffic (the check that produces
+#      UNREACHABLE_PORT instead of a 502). Container IPs live on docker0, and
+#      Docker's iptables isolation blocks that from a user-defined bridge, so a
+#      bridged deployer would flag every healthy deployment as unreachable.
+#   2. The API stays on 0.0.0.0:8002 exactly as with the systemd unit, so
+#      nothing else (Traefik, dashboards, curl) has to change.
+services:
+  deployer:
+    build: .
+    image: shipyard-container-deployer:latest
+    container_name: shipyard-container-deployer
+    restart: unless-stopped
+    network_mode: host
+    env_file:
+      - .env
+    volumes:
+      # Host daemon access: builds and workloads land on the host, siblings of
+      # this container. Root-equivalent by definition, same as the docker group.
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Named volume so an in-flight clone/build survives a container restart.
+      - shipyard-workspaces:/tmp/shipyard-workspaces
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+volumes:
+  shipyard-workspaces:
