@@ -1,3 +1,5 @@
+import asyncio
+
 import pytest
 from unittest.mock import AsyncMock, patch
 
@@ -33,6 +35,9 @@ async def test_run_container_success(runner):
         assert "-d" in run_args
         assert "--name" in run_args
         assert "shipyard-web-123" in run_args
+        # Deployed workloads must survive a host reboot / docker daemon restart
+        assert "--restart" in run_args
+        assert run_args[run_args.index("--restart") + 1] == "unless-stopped"
         assert "-p" in run_args
         assert "8080:8080" in run_args
         assert "--memory" in run_args
@@ -64,6 +69,23 @@ async def test_run_container_failure(runner):
         assert "docker run failed" in str(exc.value)
 
 @pytest.mark.asyncio
+async def test_run_container_allows_restart_policy_override(runner):
+    with patch.object(runner, "_run_cmd", new_callable=AsyncMock) as mock_cmd:
+        mock_cmd.side_effect = [(0, ""), (0, "c1a2b3d4e5f67890abcdef\n")]
+
+        await runner.run_container(
+            container_name="shipyard-web-123",
+            image_tag="shipyard-app/web:123",
+            ports=[],
+            resources={},
+            env_vars=[],
+            restart_policy="on-failure:5"
+        )
+
+        run_args = mock_cmd.call_args_list[1][0][0]
+        assert run_args[run_args.index("--restart") + 1] == "on-failure:5"
+
+@pytest.mark.asyncio
 async def test_get_container_status(runner):
     with patch.object(runner, "_run_cmd", new_callable=AsyncMock) as mock_cmd:
         mock_cmd.return_value = (0, "running\n")
@@ -73,6 +95,35 @@ async def test_get_container_status(runner):
         mock_cmd.return_value = (1, "No such container")
         status_err = await runner.get_container_status("nonexistent")
         assert status_err == "unknown"
+
+@pytest.mark.asyncio
+async def test_get_container_ip(runner):
+    with patch.object(runner, "_run_cmd", new_callable=AsyncMock) as mock_cmd:
+        mock_cmd.return_value = (0, "172.17.0.6 ")
+        assert await runner.get_container_ip("c1a2b3d4e5f6") == "172.17.0.6"
+
+        mock_cmd.return_value = (0, " ")
+        assert await runner.get_container_ip("c1a2b3d4e5f6") is None
+
+        mock_cmd.return_value = (1, "No such container")
+        assert await runner.get_container_ip("missing") is None
+
+
+@pytest.mark.asyncio
+async def test_probe_port_detects_listener_and_refused():
+    # A real loopback listener stands in for the container's process.
+    server = await asyncio.start_server(lambda r, w: w.close(), "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    try:
+        assert await DockerRunner().probe_port("127.0.0.1", port) is True
+    finally:
+        server.close()
+        await server.wait_closed()
+
+    # Port is now free: a container that is "running" but bound to loopback
+    # looks exactly like this from Traefik's side.
+    assert await DockerRunner().probe_port("127.0.0.1", port) is False
+
 
 @pytest.mark.asyncio
 async def test_get_container_logs(runner):
@@ -88,3 +139,11 @@ async def test_stop_container(runner):
         mock_cmd.return_value = (0, "c1a2b3d4e5f6\n")
         await runner.stop_container("c1a2b3d4e5f6")
         mock_cmd.assert_awaited_once_with(["docker", "stop", "c1a2b3d4e5f6"], timeout=15)
+
+
+@pytest.mark.asyncio
+async def test_remove_container(runner):
+    with patch.object(runner, "_run_cmd", new_callable=AsyncMock) as mock_cmd:
+        mock_cmd.return_value = (0, "c1a2b3d4e5f6\n")
+        await runner.remove_container("c1a2b3d4e5f6")
+        mock_cmd.assert_awaited_once_with(["docker", "rm", "-f", "c1a2b3d4e5f6"], timeout=20)

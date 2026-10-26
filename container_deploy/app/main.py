@@ -5,6 +5,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import get_settings
+from app.logging_config import configure_logging
 from app.dependencies import (
     get_db_pool,
     get_redis,
@@ -19,6 +20,10 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = get_settings()
+    # Must run before anything logs: uvicorn ships no root handler, so without
+    # this every app.* INFO line is dropped and the journal only shows
+    # WARNING+ (retries, crashes) - the worker looked silent while running.
+    configure_logging(settings.LOG_LEVEL)
     logger.info(f"Starting {settings.APP_NAME} on port {settings.PORT}...")
 
     # Initialize connection pool & worker

@@ -69,6 +69,38 @@ def test_execute_job_request_camel_case_parsing():
     assert req.service_id == "svc_camel"
     assert req.commit_sha == "deadbeef"
 
+def test_deployment_job_accepts_null_optional_fields():
+    # Real upstream payloads send explicit nulls for unset fields; the worker
+    # must not reject them as malformed.
+    data = {
+        "deployment_id": "dep_null",
+        "service_id": "svc_123",
+        "project_id": "prj_123",
+        "commit_sha": "abc12345",
+        "branch": "main",
+        "retry_count": 0,
+        "config_snapshot": {
+            "service_id": "svc_123",
+            "project_id": "prj_123",
+            "service_name": "hack_heaven",
+            "service_type": "backend",
+            "repository": "https://github.com/org/repo.git",
+            "branch": "main",
+            "build_command": None,
+            "pre_deploy_command": "pip install -r requirements.txt",
+            "start_command": "python app.py",
+            "env_vars": None,
+            "ports": [{"containerPort": 3000, "hostPort": 3000, "protocol": "tcp"}],
+            "resources": None,
+            "health_check": None
+        }
+    }
+    job = DeploymentJob.model_validate(data)
+    assert job.config_snapshot.resources is None
+    assert job.config_snapshot.env_vars is None
+    assert job.config_snapshot.ports[0]["containerPort"] == 3000
+
+
 def test_execution_event_request():
     event = ExecutionEventRequest(
         eventType="BUILD_STEP",
