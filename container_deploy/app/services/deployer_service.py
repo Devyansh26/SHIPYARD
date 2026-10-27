@@ -34,16 +34,33 @@ def sanitize_hostname_label(name: str) -> str:
     sanitized = re.sub(r"[^a-z0-9-\.]", "-", name.lower())
     return sanitized.strip("-") or "app"
 
-def build_deploy_hostname(service_name: str, deployment_id: str) -> str:
-    """Public deploy URL: shipyard-<service>-<dep8>.<DEPLOY_DOMAIN>.
+def build_deploy_hostname(service_name: str, service_id: str, deployment_id: str = "") -> str:
+    """Public deploy URL: shipyard-<service>-<svc8>.<DEPLOY_DOMAIN>.
+
+    STABLE PER SERVICE, deliberately. This used to key on the deployment id,
+    which gave every redeploy a brand-new hostname. That made the URL unusable
+    as something to hand out: a frontend built against it broke the next time
+    the backend shipped, and nothing could hold a reference to "the API".
+
+    The service id (not the name) supplies uniqueness because service names are
+    only unique *within a project* - two projects with an `api` service would
+    otherwise fight over the same hostname.
 
     First-level subdomains ride the apex wildcard covered by Cloudflare's
     Universal SSL, so no paid Advanced Certificate Manager is needed.
+
+    `deployment_id` is the fallback discriminator only: a hand-pushed Redis job
+    with no service_id still gets a working, if per-deployment, hostname rather
+    than a malformed one.
     """
     settings = get_settings()
     svc_label = sanitize_hostname_label(service_name)
-    dep_label = sanitize_hostname_label(deployment_id[:8])
-    return f"{settings.DEPLOY_SUBDOMAIN_PREFIX}-{svc_label}-{dep_label}.{settings.DEPLOY_DOMAIN}"
+    discriminator = (service_id or deployment_id or "")[:8]
+    tail = sanitize_hostname_label(discriminator) if discriminator else ""
+    host_label = f"{settings.DEPLOY_SUBDOMAIN_PREFIX}-{svc_label}"
+    if tail:
+        host_label = f"{host_label}-{tail}"
+    return f"{host_label}.{settings.DEPLOY_DOMAIN}"
 
 class DeployerService:
     # Server startup banners that reveal a loopback bind. Matches Flask/Werkzeug
@@ -314,12 +331,17 @@ class DeployerService:
         # Dynamic ingress: Traefik (docker provider on the host) consumes
         # these labels at container creation time and routes the public
         # hostname immediately - no proxy reload, no Cloudflare changes.
-        deploy_hostname = build_deploy_hostname(cfg.service_name, dep_id)
+        deploy_hostname = build_deploy_hostname(cfg.service_name, cfg.service_id, dep_id)
 
-        # Traefik router/service names must be unique per deployment and
-        # matcher-safe (alphanumerics). Include dep id so re-deploys make new
-        # hosts even for the same service.
-        router_name = sanitize_container_name(f"shipyard-{svc_clean}-{dep_id[:8]}").lower().replace("_", "-")
+        # Router name is keyed on the SERVICE, matching the hostname: one
+        # service, one route. During a redeploy the old container briefly also
+        # declares it, which Traefik resolves by keeping one definition - and
+        # `retire_superseded_containers` below closes that window as soon as the
+        # new container is proven healthy.
+        router_discriminator = sanitize_hostname_label((cfg.service_id or dep_id)[:8])
+        router_name = sanitize_container_name(
+            f"shipyard-{svc_clean}-{router_discriminator}"
+        ).lower().replace("_", "-")
 
         labels = {
             "shipyard.deployment_id": dep_id,
@@ -397,6 +419,11 @@ class DeployerService:
                 {"container_id": container_id, "deployment_url": public_url}
             )
             await self.emit_event(dep_id, "RELEASE_HEALTHY", f"Deployment is healthy and live at {public_url}")
+            # Cut over only now that the replacement is proven: a failed build
+            # must never take the running version down. Required rather than
+            # tidy-up, because the hostname is stable per service - leaving the
+            # old container up means two containers answering to one Host rule.
+            await self.retire_superseded_containers(dep_id, cfg.service_id, container_id)
         else:
             try:
                 if not active_listeners:
@@ -419,6 +446,58 @@ class DeployerService:
                 logger.warning(f"Failed to remove unhealthy container {container_id}: {e}")
             await self.mark_terminal_failed(dep_id, err)
             raise TimeoutError(err)
+
+    async def retire_superseded_containers(
+        self, deployment_id: str, service_id: str, keep_container_id: str
+    ) -> int:
+        """Stops and removes every other container belonging to this service.
+
+        Called only after the new container reports healthy, so the sequence is
+        create -> verify -> retire: a build that never comes up leaves the
+        previous version serving.
+
+        Why this lives in CDS rather than coming back as a CMS instruction: CDS
+        is the only component that talks to Docker, and the `supersedes`
+        mapping CMS holds is released by a callback CDS does not send. Doing it
+        here needs no new wiring and cannot leave an orphan if the callback
+        path stays unimplemented.
+
+        Failures are logged, never raised - a successful deployment must not be
+        reported as failed because an old container refused to die.
+        """
+        if not service_id:
+            return 0
+        try:
+            found = await self.docker_runner.find_containers_by_label(
+                "shipyard.service_id", service_id
+            )
+        except Exception as e:
+            logger.warning(f"Could not list containers for service {service_id}: {e}")
+            return 0
+
+        # Compare on the full id: `keep_container_id` may be the short form.
+        stale = [
+            cid for cid in found
+            if cid != keep_container_id and not cid.startswith(keep_container_id)
+            and not keep_container_id.startswith(cid)
+        ]
+        retired = 0
+        for cid in stale:
+            try:
+                await self.docker_runner.stop_container(cid)
+                await self.docker_runner.remove_container(cid)
+                retired += 1
+                await self.emit_event(
+                    deployment_id, "SUPERSEDED_RETIRED",
+                    f"Retired previous container {cid[:12]} for this service"
+                )
+            except Exception as e:
+                logger.warning(f"Failed to retire superseded container {cid[:12]}: {e}")
+                await self.emit_event(
+                    deployment_id, "SUPERSEDE_FAILED",
+                    f"Could not retire previous container {cid[:12]}: {e}"
+                )
+        return retired
 
     async def _probe_listener(self, container_id: str, ports: List[int]) -> bool:
         """True when at least one declared port accepts a TCP connection."""

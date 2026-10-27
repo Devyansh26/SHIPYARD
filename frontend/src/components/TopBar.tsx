@@ -76,7 +76,11 @@ export function TopBar({
   return (
     <header className="sticky top-0 z-40 border-b border-line bg-surface/85 backdrop-blur-md">
       <div className={`mx-auto flex h-14 items-center gap-3 px-5 ${tight ? 'max-w-none' : 'max-w-6xl'}`}>
-        <Link to={user ? '/projects' : '/'} className="shrink-0">
+        {/* Always the landing page. The wordmark is the way back to the marketing
+            site; "Projects" is reachable from the breadcrumb and the user menu,
+            so sending a signed-in user to /projects left them with no route
+            home at all. */}
+        <Link to="/" className="shrink-0">
           <Logo />
         </Link>
 

@@ -17,6 +17,7 @@ import { buildDeploymentJob, containerConfig } from '../providers/container.js';
 import { parseRepository, slugifyProjectName, isTerminal } from '../providers/vercel.js';
 import { requireConnection, linkServiceConnection } from '../connections/repository.js';
 import { loadEnvForDeploy } from '../envvars/repository.js';
+import { refreshUrlLinks } from '../links/service.js';
 import { query } from '../../db/pool.js';
 import {
   getOwnedService, assertNoActiveDeployment, createDeployment, patchDeployment,
@@ -130,6 +131,15 @@ export async function triggerDeployment(userId, projectId, serviceId, opts = {})
       await linkServiceConnection(serviceId, target.connection.connection_id);
     }
 
+    // Re-resolve any linked service URL before reading the environment.
+    //
+    // This is the moment that matters: `VITE_*` and `NEXT_PUBLIC_*` are inlined
+    // at build time, so whatever is in `environment_vars` right now is what the
+    // artifact will carry for its whole life. A provider deployed for the first
+    // time since the link was drawn — or moved to a new domain — is picked up
+    // here instead of silently shipping a dead address.
+    const linkRefresh = await refreshUrlLinks(userId, projectId, serviceId);
+
     const envVars = await loadEnvForDeploy(serviceId);
 
     if (target.provider === 'container') {
@@ -163,12 +173,22 @@ export async function triggerDeployment(userId, projectId, serviceId, opts = {})
           projectId: project.id,
           projectName: project.name,
           projectCreated: project.createdNow,
+          // Which project settings this deploy pushed to Vercel, and anything
+          // it refused to push. Vercel freezes a project's settings into each
+          // deployment, so "what did this build actually run with" is only
+          // answerable if we record the push that preceded it.
+          projectSettings: project.settings ?? null,
           deploymentId: started.providerDeploymentId,
           inspectorUrl: started.inspectorUrl,
         },
         // Keys only — never values. This is an audit trail of what the build
         // was given, and config_snapshot is returned to the browser.
         env: { count: envVars.length, keys: envVars.map((v) => v.key), synced: envResult },
+        // Which linked URLs this build picked up, so a frontend pointing at the
+        // wrong API is traceable to the deploy that baked the value in.
+        ...(linkRefresh.refreshed > 0 || linkRefresh.skipped.length > 0
+          ? { links: linkRefresh }
+          : {}),
       },
       finished: false,
     });
@@ -292,6 +312,57 @@ export async function syncDeployment(userId, row) {
     }
     return row;
   }
+}
+
+/**
+ * What the branch HEAD is, and whether it is already deployed.
+ *
+ * Backs the "Deploy latest commit" button: the button itself just calls the
+ * normal trigger (which has always resolved branch HEAD), but it needs to be
+ * able to say *which* commit that is and whether anything has actually moved —
+ * otherwise the user cannot tell a no-op redeploy from a real one.
+ *
+ * `deployedSha` is the newest deployment that reached a *good* state, not simply
+ * the newest row: a failed attempt at the same commit must still leave the
+ * service showing as behind, or a retry would look pointless.
+ */
+export async function getLatestCommit(userId, projectId, serviceId) {
+  const service = await getOwnedService(userId, projectId, serviceId);
+  const parsed = parseRepository(service.repository);
+  const ghToken = await loadGithubToken(userId);
+
+  const repoMeta = await github.repo(ghToken, parsed.owner, parsed.repo);
+  const branch = service.branch || repoMeta.default_branch || 'main';
+  const commits = await github.commits(ghToken, parsed.owner, parsed.repo, branch, 1, 1);
+  const head = commits?.[0];
+  if (!head?.sha) {
+    const e = new Error(`Branch "${branch}" has no commits in ${parsed.fullName}`);
+    e.status = 400; e.code = 'BRANCH_EMPTY'; throw e;
+  }
+
+  const { rows } = await query(
+    `SELECT commit_sha, status, created_at FROM deployments
+     WHERE service_id = $1 AND status = ANY($2)
+     ORDER BY created_at DESC LIMIT 1`,
+    [serviceId, ['healthy', 'queued', 'validating', 'building', 'deploying']]
+  );
+  const deployedSha = rows[0]?.commit_sha ?? null;
+
+  const message = String(head.commit?.message ?? '').split('\n')[0].slice(0, 200);
+  return {
+    branch,
+    sha: head.sha,
+    shortSha: head.sha.slice(0, 7),
+    message,
+    author: head.commit?.author?.name ?? head.author?.login ?? null,
+    committedAt: head.commit?.author?.date ?? null,
+    url: head.html_url ?? null,
+    deployedSha,
+    deployedShortSha: deployedSha ? deployedSha.slice(0, 7) : null,
+    deployedStatus: rows[0]?.status ?? null,
+    // False when the service has never deployed: there is something to ship.
+    upToDate: deployedSha === head.sha,
+  };
 }
 
 export async function getDeployment(userId, deploymentId) {

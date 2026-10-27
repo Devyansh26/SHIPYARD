@@ -44,6 +44,10 @@ export const api = {
 
   // --- deployments ----------------------------------------------------------
   deployments: (pid: string, sid: string) => req(`/api/v1/projects/${pid}/services/${sid}/deployments`),
+  // Branch HEAD + whether it is already deployed. Separate from the list on
+  // purpose: it calls GitHub, so it must not ride the 3s build poll.
+  latestCommit: (pid: string, sid: string) =>
+    req(`/api/v1/projects/${pid}/services/${sid}/deployments/latest-commit`),
   deploy: (pid: string, sid: string, data: unknown = {}) =>
     req(`/api/v1/projects/${pid}/services/${sid}/deployments`, { method: 'POST', body: JSON.stringify(data) }),
   deployment: (id: string) => req(`/api/v1/deployments/${id}`),
@@ -64,6 +68,42 @@ export const api = {
     req(`/api/v1/projects/${pid}/services/${sid}/env/${varId}`, { method: 'PATCH', body: JSON.stringify(data) }),
   deleteEnvVar: (pid: string, sid: string, varId: string) =>
     req(`/api/v1/projects/${pid}/services/${sid}/env/${varId}`, { method: 'DELETE' }),
+
+  // --- database nodes -------------------------------------------------------
+  // The connection string behind one `database` node. The user provisions the
+  // database at Neon/Atlas themselves; we store the string encrypted and never
+  // return it. 404 DATABASE_NOT_CONNECTED means "nothing attached yet" and
+  // carries the provider descriptor for the connect form.
+  databaseProviders: () => req('/api/v1/connections/database-providers'),
+  databaseConnection: (pid: string, sid: string) =>
+    req(`/api/v1/projects/${pid}/services/${sid}/database`),
+  // PUT, not POST: a node has exactly one connection string, so this is
+  // idempotent and also re-syncs any service already bound to it.
+  attachDatabase: (pid: string, sid: string, connectionString: string) =>
+    req(`/api/v1/projects/${pid}/services/${sid}/database`, {
+      method: 'PUT',
+      body: JSON.stringify({ connectionString }),
+    }),
+  testDatabase: (pid: string, sid: string) =>
+    req(`/api/v1/projects/${pid}/services/${sid}/database/test`, { method: 'POST' }),
+  detachDatabase: (pid: string, sid: string) =>
+    req(`/api/v1/projects/${pid}/services/${sid}/database`, { method: 'DELETE' }),
+
+  // --- service links --------------------------------------------------------
+  // Wiring a service to a provider node injects a value as an env var on that
+  // service: a database's connection string, or another service's live URL.
+  // `sid` is always the CONSUMER (the backend/frontend that reads it).
+  links: (pid: string, sid: string) => req(`/api/v1/projects/${pid}/services/${sid}/links`),
+  createLink: (pid: string, sid: string, data: { providerServiceId: string; varName?: string }) =>
+    req(`/api/v1/projects/${pid}/services/${sid}/links`, { method: 'POST', body: JSON.stringify(data) }),
+  deleteLink: (pid: string, sid: string, providerServiceId: string, keepVar = false) =>
+    req(
+      `/api/v1/projects/${pid}/services/${sid}/links/${providerServiceId}${keepVar ? '?keepVar=1' : ''}`,
+      { method: 'DELETE' },
+    ),
+  // Here `sid` is the PROVIDER: push its current value to everyone linked to it.
+  resyncLinks: (pid: string, sid: string) =>
+    req(`/api/v1/projects/${pid}/services/${sid}/links/resync`, { method: 'POST' }),
 };
 
 // OAuth endpoints are browser redirects, not fetches.

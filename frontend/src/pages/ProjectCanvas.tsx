@@ -8,7 +8,8 @@ import {
 import { api } from '../api'
 import {
   errCode, errMessage,
-  type Deployment, type Project, type Service, type ServiceType, type User,
+  type DatabaseProvider, type Deployment, type Project, type Service, type ServiceType,
+  type User,
 } from '../lib/types'
 import { TopBar } from '../components/TopBar'
 import { Button, Spinner } from '../components/ui'
@@ -16,6 +17,8 @@ import { TYPE_META } from '../lib/meta'
 import ServiceNode, { type ServiceFlowNode } from '../canvas/ServiceNode'
 import ServicePanel from '../canvas/ServicePanel'
 import AddServiceMenu from '../canvas/AddServiceMenu'
+import LinkDatabaseDialog from '../canvas/LinkDatabaseDialog'
+import { classifyEdge, type PendingLink } from '../lib/links'
 
 const nodeTypes: NodeTypes = { service: ServiceNode }
 
@@ -70,6 +73,16 @@ function Canvas({ user, onLogout }: { user: User; onLogout: () => void }) {
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [adding, setAdding] = useState<ServiceType | null>(null)
 
+  // Wiring a database to a service needs one piece of input (the variable name),
+  // so that edge opens a dialog instead of being created immediately.
+  const [pendingLink, setPendingLink] = useState<PendingLink | null>(null)
+  const [linkBusy, setLinkBusy] = useState(false)
+  const [linkError, setLinkError] = useState<string | null>(null)
+  // Provider descriptors (engine -> default variable name). Fetched rather than
+  // hardcoded so DATABASE_URL / MONGODB_URI live in exactly one place: the
+  // control plane's provider table.
+  const [dbProviders, setDbProviders] = useState<DatabaseProvider[]>([])
+
   const [nodes, setNodes, onNodesChange] = useNodesState<ServiceFlowNode>([])
   const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([])
 
@@ -90,6 +103,14 @@ function Canvas({ user, onLogout }: { user: User; onLogout: () => void }) {
       .finally(() => { if (alive) setLoading(false) })
     return () => { alive = false }
   }, [projectId, setNodes, setEdges])
+
+  useEffect(() => {
+    let alive = true
+    api.databaseProviders()
+      .then((r) => { if (alive) setDbProviders((r.providers ?? []) as DatabaseProvider[]) })
+      .catch(() => { /* the dialog falls back to an empty default */ })
+    return () => { alive = false }
+  }, [])
 
   // One deployment fetch per deployable service so nodes show real status
   // without opening the panel.
@@ -180,26 +201,152 @@ function Canvas({ user, onLogout }: { user: User; onLogout: () => void }) {
     [edges],
   )
 
+  /**
+   * Classifies a new edge. The rule for which end provides lives in
+   * `lib/links.ts` — it is decided by type, not drag direction, and it is the
+   * one piece of this worth testing on its own.
+   */
+  const asServiceLink = useCallback(
+    (c: FlowConnection): PendingLink | null => classifyEdge(
+      services.find((s) => s.id === c.source),
+      services.find((s) => s.id === c.target),
+      { dbProviders, urlFor: (id) => latest[id]?.url ?? null },
+    ),
+    [services, dbProviders, latest],
+  )
+
   const onConnect = useCallback(
     (c: FlowConnection) => {
       if (!isValidConnection(c)) return
+
+      // Hold off on drawing the edge: the link endpoint creates it server-side,
+      // and a cancelled dialog must leave the canvas untouched.
+      const link = asServiceLink(c)
+      if (link) {
+        setLinkError(null)
+        setPendingLink(link)
+        return
+      }
+
       setEdges((eds) => addEdge({ ...c, id: `${c.source}->${c.target}`, type: 'smoothstep' }, eds))
       const existing = services.find((s) => s.id === c.target)?.serviceConfig?.canvas?.dependsOn ?? []
       if (!existing.includes(c.source)) {
         void persistDependsOn(c.target, [...existing, c.source])
       }
     },
-    [isValidConnection, setEdges, services, persistDependsOn],
+    [isValidConnection, setEdges, services, persistDependsOn, asServiceLink],
   )
 
+  /**
+   * Creates the binding: one call writes the env var, the recorded link and the
+   * edge. The returned service is authoritative, so the local edge is rebuilt
+   * from it rather than guessed.
+   */
+  const confirmLink = useCallback(
+    async (varName: string) => {
+      if (!pendingLink) return
+      setLinkBusy(true)
+      setLinkError(null)
+      try {
+        const r = await api.createLink(projectId, pendingLink.consumerServiceId, {
+          providerServiceId: pendingLink.providerServiceId,
+          varName,
+        })
+        const updated = r.service as Service
+        setServices((prev) => prev.map((s) => (s.id === updated.id ? updated : s)))
+        setEdges((eds) => {
+          const id = `${pendingLink.providerServiceId}->${pendingLink.consumerServiceId}`
+          if (eds.some((e) => e.id === id)) return eds
+          return [...eds, {
+            id,
+            source: pendingLink.providerServiceId,
+            target: pendingLink.consumerServiceId,
+            type: 'smoothstep',
+          }]
+        })
+        setPendingLink(null)
+      } catch (e) {
+        const code = errCode(e)
+        if (code === 'DATABASE_NOT_CONNECTED' || code === 'SERVICE_NOT_DEPLOYED') {
+          // Actionable: the node exists but has no credential yet. Send them to
+          // it rather than leaving a dead-end error on the dialog.
+          setLinkError(
+            `${errMessage(e, 'That node has nothing to inject yet.')} `
+            + (code === 'SERVICE_NOT_DEPLOYED'
+              ? 'Opening it now — deploy it first, then wire the edge again.'
+              : 'Opening it now — attach a connection string on its Connection tab, then wire the edge again.'),
+          )
+          const dbId = pendingLink.providerServiceId
+          setTimeout(() => { setPendingLink(null); setSelectedId(dbId) }, 2200)
+        } else {
+          setLinkError(`${errCode(e) ?? 'Error'} — ${errMessage(e, 'Could not link that database')}`)
+        }
+      } finally {
+        setLinkBusy(false)
+      }
+    },
+    [pendingLink, projectId, setEdges],
+  )
+
+  /**
+   * Draws the edge as a plain dependency — no variable, no env var.
+   *
+   * The canvas has always supported a documentation-only arrow, and wiring a
+   * variable into every edge would quietly remove that. Same persistence path
+   * as any other dependency edge.
+   */
+  const drawPlainEdge = useCallback(() => {
+    if (!pendingLink) return
+    const { providerServiceId: from, consumerServiceId: to } = pendingLink
+    setEdges((eds) => {
+      const id = `${from}->${to}`
+      if (eds.some((e) => e.id === id)) return eds
+      return [...eds, { id, source: from, target: to, type: 'smoothstep' }]
+    })
+    const existing = services.find((s) => s.id === to)?.serviceConfig?.canvas?.dependsOn ?? []
+    if (!existing.includes(from)) void persistDependsOn(to, [...existing, from])
+    setPendingLink(null)
+    setLinkError(null)
+  }, [pendingLink, services, persistDependsOn, setEdges])
+
+  /**
+   * Removing an edge that carries a database binding must remove the binding,
+   * not just the arrow — otherwise the service keeps a connection string it is
+   * no longer shown as using, which is the worst of both states. Confirmed
+   * first, because unlike a plain edge this deletes a variable.
+   */
   const onEdgesDelete = useCallback(
     (removed: Edge[]) => {
       for (const e of removed) {
-        const existing = services.find((s) => s.id === e.target)?.serviceConfig?.canvas?.dependsOn ?? []
+        const consumer = services.find((s) => s.id === e.target)
+        const link = consumer?.serviceConfig?.links?.[e.source]
+
+        if (consumer && link) {
+          const ok = window.confirm(
+            `Unlink this from "${consumer.name}"?\n\n`
+            + `${link.varName} will be deleted from its environment variables. `
+            + 'The node it points at is untouched. Redeploy to apply.',
+          )
+          if (!ok) {
+            // Put the arrow back — the binding still exists.
+            setEdges((eds) => (eds.some((x) => x.id === e.id) ? eds : [...eds, e]))
+            continue
+          }
+          void api.deleteLink(projectId, consumer.id, e.source)
+            .then((r) => {
+              if (r.service) {
+                setServices((prev) => prev.map((s) => (s.id === consumer.id ? (r.service as Service) : s)))
+              }
+            })
+            .catch(() => { setError('Could not remove that database link — reload to see its real state.') })
+          continue
+        }
+
+        const existing = consumer?.serviceConfig?.canvas?.dependsOn ?? []
         void persistDependsOn(e.target, existing.filter((id) => id !== e.source))
       }
     },
-    [services, persistDependsOn],
+    [services, persistDependsOn, projectId, setEdges],
   )
 
   /** Names are unique per project, so suffix until free. */
@@ -404,6 +551,15 @@ function Canvas({ user, onLogout }: { user: User; onLogout: () => void }) {
             </p>
           </div>
         )}
+
+        <LinkDatabaseDialog
+          pending={pendingLink}
+          busy={linkBusy}
+          error={linkError}
+          onCancel={() => { setPendingLink(null); setLinkError(null) }}
+          onConfirm={(varName) => void confirmLink(varName)}
+          onPlainEdge={drawPlainEdge}
+        />
 
         <ServicePanel
           projectId={projectId}

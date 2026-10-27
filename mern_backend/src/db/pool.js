@@ -5,7 +5,11 @@ import { env, isProd } from '../config/env.js';
 // instead: pg-connection-string currently treats `sslmode=require` as
 // `verify-full` and warns that the alias will change to libpq semantics in
 // pg v9. Owning the ssl object keeps behaviour identical across that bump.
-function buildConfig(url) {
+//
+// Exported because the same treatment is needed for a *user-supplied* Neon
+// connection string when verifying it (providers/database.js) — a second
+// implementation of this would drift.
+export function buildConfig(url) {
   let connectionString = url;
   let ssl = isProd;
   try {

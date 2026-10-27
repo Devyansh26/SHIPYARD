@@ -5,6 +5,7 @@ import { validate } from '../../middleware/validate.js';
 import { asyncHandler } from '../../utils/asyncHandler.js';
 import {
   triggerDeployment, listDeployments, getDeployment, getDeploymentLogs, cancelDeployment,
+  getLatestCommit,
 } from './service.js';
 
 const triggerSchema = z.object({
@@ -27,6 +28,20 @@ serviceDeploymentRoutes.post('/', validate(triggerSchema), asyncHandler(async (r
 serviceDeploymentRoutes.get('/', asyncHandler(async (req, res) => {
   const deployments = await listDeployments(req.userId, req.params.projectId, req.params.serviceId);
   res.json({ deployments, total: deployments.length });
+}));
+
+/**
+ * The branch HEAD, and whether it is already deployed. Declared before any
+ * `/:param` route on this router so "latest-commit" cannot be captured as an id.
+ *
+ * Deliberately a separate request from the deployment list: it hits GitHub, so
+ * folding it into the list would put a third-party API on the 3s poll that
+ * follows a build.
+ */
+serviceDeploymentRoutes.get('/latest-commit', asyncHandler(async (req, res) => {
+  res.json({
+    commit: await getLatestCommit(req.userId, req.params.projectId, req.params.serviceId),
+  });
 }));
 
 // Mounted at /api/v1/deployments — a deployment id is globally unique, so these

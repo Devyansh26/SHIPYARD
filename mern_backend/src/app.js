@@ -13,6 +13,8 @@ import serviceRoutes from './modules/services/routes.js';
 import connectionRoutes from './modules/connections/routes.js';
 import { serviceDeploymentRoutes, deploymentRoutes } from './modules/deployments/routes.js';
 import envVarRoutes from './modules/envvars/routes.js';
+import databaseRoutes from './modules/database/routes.js';
+import linkRoutes from './modules/links/routes.js';
 import internalRoutes from './modules/internal/routes.js';
 
 export function createApp() {
@@ -41,6 +43,11 @@ export function createApp() {
   app.use('/api/v1/projects/:projectId/services/:serviceId/deployments', serviceDeploymentRoutes);
   // Environment variables: encrypted at rest, pushed to the provider on deploy.
   app.use('/api/v1/projects/:projectId/services/:serviceId/env', envVarRoutes);
+  // The connection string behind a `database` node (Neon / MongoDB Atlas).
+  app.use('/api/v1/projects/:projectId/services/:serviceId/database', databaseRoutes);
+  // Database bindings: wiring a backend to a database node injects its
+  // connection string as an environment variable on the backend.
+  app.use('/api/v1/projects/:projectId/services/:serviceId/links', linkRoutes);
   app.use('/api/v1/deployments', deploymentRoutes);
   // Service-to-service (CMS / deployment worker), shared-secret auth, no session.
   app.use('/api/v1/internal', internalRoutes);

@@ -2,7 +2,7 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock
 
 from app.models.job import DeploymentJob, ServiceConfigSnapshot
-from app.services.deployer_service import DeployerService
+from app.services.deployer_service import DeployerService, build_deploy_hostname
 
 class MockPoolContext:
     def __init__(self, conn):
@@ -42,6 +42,7 @@ def mock_docker_runner():
     runner.probe_port = AsyncMock(return_value=True)
     runner.remove_container = AsyncMock()
     runner.stop_container = AsyncMock()
+    runner.find_containers_by_label = AsyncMock(return_value=[])
     return runner
 
 @pytest.fixture
@@ -99,11 +100,12 @@ async def test_execute_happy_path(deployer, sample_job, mock_conn, mock_docker_r
     args = last_update[0]
     assert args[1] == "healthy"  # $1: status
     assert args[5] == "cnt_456"   # $5: container_id
-    assert args[6] == "https://shipyard-web-dep-100.divy13ansh.in"  # $6: deployment_url
+    # Keyed on the service id, so a redeploy keeps the same public address.
+    assert args[6] == "https://shipyard-web-svc-200.divy13ansh.in"  # $6: deployment_url
 
     # Traefik routing labels must be attached for dynamic ingress
     assert call_kwargs["labels"]["traefik.enable"] == "true"
-    assert any("Host(`shipyard-web-dep-100.divy13ansh.in`)" in v for v in call_kwargs["labels"].values())
+    assert any("Host(`shipyard-web-svc-200.divy13ansh.in`)" in v for v in call_kwargs["labels"].values())
 
 @pytest.mark.asyncio
 async def test_execute_lowercases_image_tag_for_mixed_case_service(deployer, sample_job, mock_image_builder, mock_docker_runner):
@@ -301,3 +303,95 @@ def test_diagnose_unreachable_with_active_listeners():
     crash_msg = svc.diagnose_unreachable("Error: pg_config not found\nexit code 1", [5000], container_status="exited")
     assert "crashed or exited prematurely" in crash_msg
     assert "exit code 1" in crash_msg
+
+
+# --- stable per-service hostname ---------------------------------------------
+# The hostname used to embed the deployment id, so every redeploy moved the
+# service to a new address. Anything holding a reference to "the API" - a
+# frontend built against it, most of all - broke on the next deploy.
+
+def test_build_deploy_hostname_is_stable_across_deployments():
+    first = build_deploy_hostname("web", "svc_abcdef123456", "dep_111")
+    second = build_deploy_hostname("web", "svc_abcdef123456", "dep_999")
+    assert first == second
+
+def test_build_deploy_hostname_distinguishes_same_named_services():
+    """Service names are unique per project, not globally."""
+    a = build_deploy_hostname("api", "svc_aaaaaaaa1111", "dep_1")
+    b = build_deploy_hostname("api", "svc_bbbbbbbb2222", "dep_1")
+    assert a != b
+
+def test_build_deploy_hostname_is_dns_safe():
+    host = build_deploy_hostname("My Cool API!", "svc_abcdef123456", "dep_1")
+    label = host.split(".")[0]
+    assert label == label.lower()
+    assert all(c.isalnum() or c == "-" for c in label), label
+    assert not label.startswith("-") and not label.endswith("-")
+
+def test_build_deploy_hostname_falls_back_to_deployment_id():
+    """A hand-pushed Redis job with no service_id must still get a valid host."""
+    host = build_deploy_hostname("web", "", "dep_abcdef99")
+    assert "shipyard-web-" in host
+    assert ".." not in host and "--" not in host
+
+# --- cutover ------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_execute_retires_previous_container_once_healthy(
+    deployer, sample_job, mock_docker_runner
+):
+    mock_docker_runner.find_containers_by_label = AsyncMock(
+        return_value=["old_container_111", "cnt_456"]
+    )
+    await deployer.execute(sample_job, healthcheck_max_retries=2, poll_interval=0.01)
+
+    mock_docker_runner.stop_container.assert_awaited_once_with("old_container_111")
+    mock_docker_runner.remove_container.assert_awaited_once_with("old_container_111")
+
+@pytest.mark.asyncio
+async def test_execute_keeps_previous_container_when_new_one_is_unhealthy(
+    deployer, sample_job, mock_docker_runner
+):
+    """A failed deploy must never take the running version down."""
+    mock_docker_runner.find_containers_by_label = AsyncMock(
+        return_value=["old_container_111", "cnt_456"]
+    )
+    mock_docker_runner.probe_port = AsyncMock(return_value=False)
+    mock_docker_runner.get_listening_ports = AsyncMock(return_value=[])
+
+    with pytest.raises(TimeoutError):
+        await deployer.execute(sample_job, healthcheck_max_retries=1, poll_interval=0.01)
+
+    assert "old_container_111" not in [
+        c.args[0] for c in mock_docker_runner.stop_container.await_args_list
+    ]
+
+@pytest.mark.asyncio
+async def test_retire_superseded_never_touches_the_new_container(
+    deployer, mock_docker_runner
+):
+    mock_docker_runner.find_containers_by_label = AsyncMock(
+        return_value=["cnt_456_full_id", "other_999"]
+    )
+    retired = await deployer.retire_superseded_containers(
+        "dep_100", "svc_200", "cnt_456_full_id"
+    )
+    assert retired == 1
+    mock_docker_runner.stop_container.assert_awaited_once_with("other_999")
+
+@pytest.mark.asyncio
+async def test_retire_superseded_survives_a_docker_failure(
+    deployer, mock_docker_runner
+):
+    """A stubborn old container must not turn a good deployment into a failure."""
+    mock_docker_runner.find_containers_by_label = AsyncMock(return_value=["stuck_1"])
+    mock_docker_runner.stop_container = AsyncMock(side_effect=RuntimeError("daemon busy"))
+
+    retired = await deployer.retire_superseded_containers("dep_100", "svc_200", "cnt_new")
+    assert retired == 0
+
+@pytest.mark.asyncio
+async def test_retire_superseded_noops_without_a_service_id(deployer, mock_docker_runner):
+    retired = await deployer.retire_superseded_containers("dep_100", "", "cnt_new")
+    assert retired == 0
+    mock_docker_runner.find_containers_by_label.assert_not_awaited()

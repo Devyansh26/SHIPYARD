@@ -40,6 +40,74 @@ export async function requireConnection(userId, providerType) {
   return row;
 }
 
+/**
+ * Always INSERTs a new row, unlike `upsertConnection`.
+ *
+ * Vercel is one-account-per-user, so it upserts. A database connection is one
+ * row per *database*: a user can attach a Neon Postgres to one project and a
+ * different one to another, and each `database` service node points at its own
+ * row through `services.provider_connection_id`. Upserting here would make the
+ * second database silently replace the first.
+ */
+export async function createConnection(userId, { providerType, externalAccountId, credentialsRef }) {
+  const { rows } = await query(
+    `INSERT INTO provider_connections
+       (connection_id, user_id, provider_type, external_account_id, credentials_ref, connection_status)
+     VALUES ($1, $2, $3, $4, $5, 'active')
+     RETURNING ${COLS}`,
+    [ID.connection(), userId, providerType, externalAccountId ?? null, credentialsRef]
+  );
+  return rows[0];
+}
+
+export async function listConnectionsByType(userId, providerType) {
+  const { rows } = await query(
+    `SELECT ${COLS} FROM provider_connections
+     WHERE user_id = $1 AND provider_type = $2 AND connection_status = 'active'
+     ORDER BY created_at DESC`,
+    [userId, providerType]
+  );
+  return rows;
+}
+
+/** Raw row by id, scoped to the owner. Unknown or unowned => 404, never 403. */
+export async function getOwnedConnection(userId, connectionId) {
+  const { rows } = await query(
+    `SELECT ${COLS} FROM provider_connections WHERE connection_id = $1 AND user_id = $2`,
+    [connectionId, userId]
+  );
+  if (rows.length === 0) {
+    const e = new Error('Connection not found');
+    e.status = 404; e.code = 'NOT_FOUND'; throw e;
+  }
+  return rows[0];
+}
+
+export async function updateConnectionCredentials(userId, connectionId, { externalAccountId, credentialsRef }) {
+  await getOwnedConnection(userId, connectionId);
+  const { rows } = await query(
+    `UPDATE provider_connections SET
+       external_account_id = $3,
+       credentials_ref = $4,
+       connection_status = 'active'
+     WHERE connection_id = $1 AND user_id = $2
+     RETURNING ${COLS}`,
+    [connectionId, userId, externalAccountId ?? null, credentialsRef]
+  );
+  return rows[0];
+}
+
+// Revoke rather than delete, for the same reason as revokeConnection: a service
+// row references this one, and the record of what was attached is worth keeping.
+export async function revokeConnectionById(userId, connectionId) {
+  await getOwnedConnection(userId, connectionId);
+  await query(
+    `UPDATE provider_connections SET connection_status = 'revoked'
+     WHERE connection_id = $1 AND user_id = $2`,
+    [connectionId, userId]
+  );
+}
+
 export async function listConnections(userId) {
   const { rows } = await query(
     `SELECT ${COLS} FROM provider_connections WHERE user_id = $1 ORDER BY provider_type`,

@@ -38,6 +38,20 @@ export type VercelMeta = {
   target?: 'production' | 'preview'
 }
 
+/** service_config.links — one entry per database this service reads. */
+export type ServiceLinkMeta = {
+  /** Absent on records written before url links existed — those are databases. */
+  kind?: 'database' | 'url'
+  varName: string
+  providerType?: string | null
+  engine?: string | null
+  scope?: EnvScope
+  databaseLabel?: string | null
+  /** url links only: the address that was injected. */
+  url?: string | null
+  linkedAt?: string | null
+}
+
 export type Service = {
   id: string
   projectId: string
@@ -58,9 +72,77 @@ export type Service = {
     container?: ContainerMeta
     /** database services only */
     engine?: string
+    /** Databases this service reads, keyed by the database node's service id. */
+    links?: Record<string, ServiceLinkMeta>
   } & Record<string, unknown>
   createdAt: string | null
   updatedAt: string | null
+}
+
+/** A database node's provider descriptor, served by the control plane. */
+export type DatabaseProvider = {
+  providerType: 'neon' | 'atlas'
+  label: string
+  engine: string
+  kind: 'sql' | 'nosql'
+  consoleUrl: string
+  defaultVarName: string
+  /** 'connect' = a live SELECT 1 ran; 'format' = shape checked only. */
+  verifyMethod: 'connect' | 'format'
+  placeholder?: string
+}
+
+export type DatabaseAttachment = {
+  connection: Connection
+  provider: DatabaseProvider
+  /** Host / database / user only — the password never reaches the browser. */
+  database: { host: string; name: string | null; user: string | null; label: string } | null
+  decryptable: boolean
+  verification?: DatabaseVerification
+  resynced?: { updated: number; services?: { serviceName: string; varName: string }[] }
+}
+
+export type DatabaseVerification = {
+  verified: boolean
+  method: 'connect' | 'format'
+  detail: string
+  warnings?: string[]
+}
+
+/** A backend<->database binding, as reported by GET .../links. */
+export type ServiceLink = {
+  providerServiceId: string
+  /** Alias of providerServiceId, kept for the database-only call sites. */
+  databaseServiceId: string
+  kind: 'database' | 'url'
+  providerName: string | null
+  providerServiceType: ServiceType | null
+  databaseName: string | null
+  varName: string
+  providerType: string | null
+  engine: string | null
+  scope: EnvScope
+  databaseLabel: string | null
+  /** url links: what was injected, what the provider answers on now. */
+  url?: string | null
+  liveUrl?: string | null
+  /** True when the provider has moved since the value was injected. */
+  stale?: boolean
+  linkedAt: string | null
+}
+
+export type LatestCommit = {
+  branch: string
+  sha: string
+  shortSha: string
+  message: string
+  author: string | null
+  committedAt: string | null
+  url: string | null
+  deployedSha: string | null
+  deployedShortSha: string | null
+  deployedStatus: DeploymentStatus | null
+  upToDate: boolean
 }
 
 export type DeploymentStatus =

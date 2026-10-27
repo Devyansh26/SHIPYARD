@@ -158,6 +158,47 @@ export async function deleteService(userId, projectId, serviceId) {
   );
 }
 
+/**
+ * Shallow-merges top-level keys into `service_config`, server-side.
+ *
+ * The services PATCH *replaces* that column, which is wrong for anything the
+ * client did not author: a caller that wanted to record one key would have to
+ * round-trip the whole object — including values `serializeService` already
+ * redacted to '********'. This is the same reason `updateServiceCanvas` exists;
+ * it is the generic form, used for `links` (database bindings).
+ *
+ * Only the supplied keys change. Pass `{ links: {...} }` to replace the whole
+ * links map, which is what the link routes want — they compute the new map from
+ * the old one and write it back as a unit.
+ */
+export async function mergeServiceConfig(userId, projectId, serviceId, patch) {
+  await getService(userId, projectId, serviceId);
+  const { rows } = await query(
+    `UPDATE services s
+       SET service_config = COALESCE(s.service_config, '{}'::jsonb) || $4::jsonb
+     FROM projects p
+     WHERE s.service_id = $1 AND s.project_id = $2
+       AND p.project_id = s.project_id AND p.user_id = $3
+     RETURNING ${S_COLS}`,
+    [serviceId, projectId, userId, JSON.stringify(patch)]
+  );
+  return serializeService(rows[0]);
+}
+
+/** Raw row, ownership-checked — for callers that need unredacted config. */
+export async function getOwnedServiceRow(userId, projectId, serviceId) {
+  const { rows } = await query(
+    `SELECT ${S_COLS} FROM services s JOIN projects p ON p.project_id=s.project_id
+     WHERE s.service_id=$1 AND s.project_id=$2 AND p.user_id=$3`,
+    [serviceId, projectId, userId]
+  );
+  if (rows.length === 0) {
+    const e = new Error('Service not found');
+    e.status = 404; e.code = 'NOT_FOUND'; throw e;
+  }
+  return rows[0];
+}
+
 // Canvas layout (node position + graph edges) lives in service_config.canvas.
 // Two levels of `||` on purpose:
 //   outer — never clobber sibling keys like service_config.vercel, and spare

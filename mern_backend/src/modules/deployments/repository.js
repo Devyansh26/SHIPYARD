@@ -113,6 +113,26 @@ export async function findRunningContainerDeployment(serviceId) {
   return rows[0] ?? null;
 }
 
+/**
+ * The URL this service is currently reachable at, or null if it has never
+ * successfully deployed.
+ *
+ * `healthy` only, deliberately. A `building` row has no URL yet and a `failed`
+ * one points at something that is not serving, so either would hand a consumer
+ * a dead address — and for a container the address is derived from the
+ * deployment id (`shipyard-<service>-<dep8>.<domain>`), which means the URL of
+ * a superseded deployment stops resolving once its container is torn down.
+ */
+export async function findLiveUrl(serviceId) {
+  const { rows } = await query(
+    `SELECT deployment_id, deployment_url, created_at FROM deployments
+     WHERE service_id = $1 AND status = 'healthy' AND deployment_url IS NOT NULL
+     ORDER BY created_at DESC LIMIT 1`,
+    [serviceId]
+  );
+  return rows[0] ?? null;
+}
+
 /** Every distinct container this service still has running, for teardown. */
 export async function findServiceContainers(serviceId) {
   const { rows } = await query(
