@@ -154,6 +154,21 @@ class DockerRunner:
         """Force-remove a workload (failed deployments should not keep running)."""
         await self._run_cmd(["docker", "rm", "-f", container_id], timeout=20)
 
+    async def find_containers_by_label(self, key: str, value: str) -> List[str]:
+        """Full container ids carrying label `key=value`, running or not.
+
+        Used to find the previous container for a service during a redeploy.
+        The label is the only reliable handle: container *names* carry the
+        deployment id, so they cannot be derived from the service alone.
+        """
+        code, out = await self._run_cmd(
+            ["docker", "ps", "-aq", "--no-trunc", "--filter", f"label={key}={value}"],
+            timeout=15
+        )
+        if code != 0:
+            return []
+        return [line.strip() for line in out.splitlines() if line.strip()]
+
     async def get_listening_ports(self, container_id: str) -> List[Tuple[str, int]]:
         """
         Detects active TCP listening sockets inside the container.

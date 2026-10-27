@@ -26,6 +26,58 @@ function normalizeRootDirectory(dir) {
   return trimmed === '' || trimmed === '.' ? null : trimmed;
 }
 
+// An empty command must reach Vercel as null, not '': null means "use the
+// framework preset default", '' pins an empty command and breaks the build.
+// Trimmed because a trailing space in a pasted command ("pnpm install ") would
+// otherwise read as drift on every single deploy.
+function blankToNull(v) {
+  const trimmed = String(v ?? '').trim();
+  return trimmed === '' ? null : trimmed;
+}
+
+// Next.js on Vercel must NOT have an output directory pinned — Vercel's own
+// Next builder owns `.next` and assembles the serverless/edge functions from
+// it. Pinning it makes Vercel treat the build as a plain static directory, and
+// the symptom is not a build failure: the deploy goes green and then every
+// request that hits middleware answers 500 MIDDLEWARE_INVOCATION_FAILED.
+// Dropping the value is safe — it is exactly what Vercel's own dashboard does
+// for a Next.js project — so this corrects it and says so rather than
+// faithfully shipping a known-broken setting.
+const NEXT_OUTPUT_DIR = /^\.?\/?\.next\/?$/;
+
+function managedSettings(spec) {
+  const framework = blankToNull(spec.framework);
+  const outputDirectory = blankToNull(spec.outputDirectory);
+  const warnings = [];
+
+  let output = outputDirectory;
+  if (framework === 'nextjs' && output !== null && NEXT_OUTPUT_DIR.test(output)) {
+    warnings.push(
+      `Output directory "${outputDirectory}" was not sent: Vercel manages .next itself for `
+      + 'Next.js, and pinning it deploys a broken build. Leave the field empty.'
+    );
+    output = null;
+  }
+
+  return {
+    settings: {
+      framework,
+      buildCommand: blankToNull(spec.buildCommand),
+      installCommand: blankToNull(spec.installCommand),
+      outputDirectory: output,
+      rootDirectory: normalizeRootDirectory(spec.rootDirectory),
+    },
+    warnings,
+  };
+}
+
+// Vercel returns undefined for an unset field and we send null for one, so
+// compare them as equal; everything else is a trimmed string compare.
+function sameSetting(a, b) {
+  const norm = (v) => (v === undefined || v === null || v === '' ? null : String(v).trim());
+  return norm(a) === norm(b);
+}
+
 function createVercelAdapter({ token, teamId }) {
   const vc = vercelClient({ token, teamId });
 
@@ -42,27 +94,78 @@ function createVercelAdapter({ token, teamId }) {
       };
     },
 
-    // Idempotent: reuse the user's existing Vercel project when the name is
-    // already taken by them, so redeploys do not pile up projects.
-    async ensureProject({ name, repoFullName, framework, rootDirectory, buildCommand, installCommand, outputDirectory }) {
+    /**
+     * Idempotent: reuse the user's existing Vercel project when the name is
+     * already taken by them, so redeploys do not pile up projects.
+     *
+     * It also PUSHES the settings ShipYard holds onto that existing project.
+     * This is the whole point of editing them in the panel: Vercel snapshots a
+     * project's settings into each deployment at creation time, so a project
+     * created on day one kept building with day-one settings forever and every
+     * later edit lived only in our database. The symptoms were a redeploy that
+     * ignored a changed build/install command, and — where the stale preset no
+     * longer matched the repo — a green deploy whose pages answered
+     * 500 MIDDLEWARE_INVOCATION_FAILED.
+     *
+     * Only the five fields ShipYard owns are touched, and only when they
+     * actually differ: anything the user set in the Vercel dashboard that we do
+     * not model (node version, analytics, protection) is left alone, and an
+     * unchanged service costs one PATCH-free GET.
+     */
+    async ensureProject(spec) {
+      const { settings, warnings } = managedSettings(spec);
+
+      let existing = null;
       try {
-        const existing = await vc.getProject(name);
-        return { id: existing.id, name: existing.name, createdNow: false };
+        existing = await vc.getProject(spec.name);
       } catch (e) {
         if (e.code !== 'VERCEL_NOT_FOUND') throw e;
       }
-      const created = await vc.createProject({
-        name,
-        framework: framework ?? null,
-        gitRepository: { type: 'github', repo: repoFullName },
-        // null means "use the framework preset default" — sending "" would
-        // pin an empty command and break the build.
-        rootDirectory: normalizeRootDirectory(rootDirectory),
-        buildCommand: buildCommand || null,
-        installCommand: installCommand || null,
-        outputDirectory: outputDirectory || null,
-      });
-      return { id: created.id, name: created.name, createdNow: true };
+
+      if (!existing) {
+        const created = await vc.createProject({
+          name: spec.name,
+          gitRepository: { type: 'github', repo: spec.repoFullName },
+          ...settings,
+        });
+        return {
+          id: created.id,
+          name: created.name,
+          createdNow: true,
+          settings: { pushed: Object.keys(settings), warnings },
+        };
+      }
+
+      const changed = {};
+      for (const [key, value] of Object.entries(settings)) {
+        if (!sameSetting(existing[key], value)) changed[key] = value;
+      }
+
+      if (Object.keys(changed).length === 0) {
+        return {
+          id: existing.id,
+          name: existing.name,
+          createdNow: false,
+          settings: { pushed: [], warnings },
+        };
+      }
+
+      // Vercel resets a field to its preset default when it receives null, so
+      // sending the nulls above is meaningful rather than a no-op.
+      const patched = await vc.updateProject(existing.id, changed);
+      return {
+        id: patched?.id ?? existing.id,
+        name: patched?.name ?? existing.name,
+        createdNow: false,
+        settings: {
+          pushed: Object.keys(changed),
+          // Before/after, so a surprising build is traceable to the settings
+          // this deploy changed. No secrets — these are build commands.
+          from: Object.fromEntries(Object.keys(changed).map((k) => [k, existing[k] ?? null])),
+          to: changed,
+          warnings,
+        },
+      };
     },
 
     async deploy({ projectId, projectName, repoId, repoFullName, ref, target = 'production' }) {

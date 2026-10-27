@@ -3,7 +3,8 @@ import { api, OAUTH } from '../api'
 import { usePoll } from '../lib/hooks'
 import {
   errCode, errMessage,
-  type Connection, type ContainerTarget, type Deployment, type Service,
+  type Connection, type ContainerTarget, type DatabaseAttachment, type DatabaseProvider,
+  type Deployment, type LatestCommit, type Service, type ServiceLink,
 } from '../lib/types'
 import { Button, Field, Spinner, StatusBadge } from '../components/ui'
 import { CloseIcon, ExternalIcon, GithubMark, TYPE_ICON, VercelMark } from '../components/icons'
@@ -125,9 +126,12 @@ function PanelBody({
           />
         )}
         {tab === 'connection' && (
-          meta.deployable && service.serviceType === 'backend'
-            ? <ContainerTargetTab />
-            : <ConnectionTab />
+          service.serviceType === 'database'
+            // A database node connects to Neon/Atlas, not to a deploy target.
+            ? <DatabaseConnectionTab projectId={projectId} service={service} onSaved={onSaved} />
+            : service.serviceType === 'backend'
+              ? <ContainerTargetTab projectId={projectId} service={service} onSaved={onSaved} />
+              : <ConnectionTab projectId={projectId} service={service} onSaved={onSaved} />
         )}
       </div>
     </>
@@ -145,6 +149,8 @@ function DeployTab({
   onNeedConnection: () => void
 }) {
   const [deployments, setDeployments] = useState<Deployment[]>([])
+  const [commit, setCommit] = useState<LatestCommit | null>(null)
+  const [commitError, setCommitError] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -167,7 +173,26 @@ function DeployTab({
     }
   }, [deployable, projectId, service.id, onDeploymentChange])
 
+  /**
+   * Branch HEAD. Its own request because it calls GitHub — folding it into the
+   * deployment list would put a third-party API on the 3s build poll. A failure
+   * here is non-blocking: the deploy button still works, it just cannot say
+   * which commit it is about to ship.
+   */
+  const loadCommit = useCallback(async () => {
+    if (!deployable || !service.repository) return
+    setCommitError(null)
+    try {
+      const r = await api.latestCommit(projectId, service.id)
+      setCommit(r.commit as LatestCommit)
+    } catch (e) {
+      setCommit(null)
+      setCommitError(errMessage(e, 'Could not read the latest commit'))
+    }
+  }, [deployable, projectId, service.id, service.repository])
+
   useEffect(() => { void load() }, [load])
+  useEffect(() => { void loadCommit() }, [loadCommit])
 
   const inFlight = deployments.some((d) => !d.isTerminal)
   // The list endpoint syncs non-terminal rows from Vercel server-side, so
@@ -180,12 +205,18 @@ function DeployTab({
     try {
       await api.deploy(projectId, service.id)
       await load()
+      // The deployed sha has moved, so the "new commit" banner must re-resolve.
+      await loadCommit()
     } catch (e) {
-      if (errCode(e) === 'VERCEL_NOT_CONNECTED') {
+      const code = errCode(e)
+      if (code === 'VERCEL_NOT_CONNECTED') {
         setError('Connect your Vercel account first.')
         onNeedConnection()
+      } else if (code === 'CONTAINER_TARGET_NOT_CONFIGURED') {
+        setError(errMessage(e, 'The container host is not configured on this server.'))
+        onNeedConnection()
       } else {
-        setError(`${errCode(e) ?? 'Error'} — ${errMessage(e, 'Deploy failed')}`)
+        setError(`${code ?? 'Error'} — ${errMessage(e, 'Deploy failed')}`)
       }
     } finally {
       setBusy(false)
@@ -206,33 +237,66 @@ function DeployTab({
 
   if (!deployable) {
     return (
-      <div className="rounded-xl border border-dashed border-line bg-sunken p-4">
-        <p className="text-[13px] font-medium text-ink">Provisioning not available yet</p>
-        <p className="mt-1.5 text-[12.5px] leading-relaxed text-muted">
-          Database nodes record your intended engine and sit in the graph as a dependency, but no
-          provider adapter creates them yet. Vercel is the only live target — use it for frontend and
-          backend nodes.
+      <div className="space-y-3">
+        <div className="rounded-xl border border-dashed border-line bg-sunken p-4">
+          <p className="text-[13px] font-medium text-ink">Databases are not provisioned here</p>
+          <p className="mt-1.5 text-[12.5px] leading-relaxed text-muted">
+            ShipYard never creates or deletes a database — you create it in your own Neon
+            (Postgres) or MongoDB Atlas account and attach its connection string on the{' '}
+            <button
+              onClick={onNeedConnection}
+              className="font-medium text-ink underline underline-offset-2"
+            >
+              Connection
+            </button>{' '}
+            tab. There is nothing to deploy: the database already exists.
+          </p>
+        </div>
+        <p className="text-[11px] leading-relaxed text-faint">
+          Once it is attached, drag from this node to a backend on the canvas and its connection
+          string is injected there as an environment variable.
         </p>
       </div>
     )
   }
 
+  // Nothing new to ship, so the primary action is a plain redeploy. Only claim
+  // this once the commit is actually known — an unknown HEAD is not "up to date".
+  const behind = commit !== null && !commit.upToDate
+  const deployLabel = busy
+    ? 'Starting…'
+    : inFlight
+      ? 'Deploying…'
+      : behind
+        ? 'Deploy latest commit'
+        : commit?.upToDate
+          ? 'Redeploy'
+          : 'Deploy'
+
   return (
     <div className="space-y-4">
       <div className="flex items-center gap-2">
         <Button onClick={deploy} disabled={busy || inFlight || !service.repository}>
-          {busy ? <><Spinner /> Starting…</> : inFlight ? 'Deploying…' : 'Deploy'}
+          {busy ? <><Spinner /> {deployLabel}</> : deployLabel}
         </Button>
-        <Button variant="ghost" size="sm" onClick={() => void load()}>Refresh</Button>
+        <Button variant="ghost" size="sm" onClick={() => { void load(); void loadCommit() }}>
+          Refresh
+        </Button>
         {inFlight && <span className="text-[11px] text-faint">syncing every 3s</span>}
       </div>
 
+      <CommitCard
+        commit={commit}
+        error={commitError}
+        branch={service.branch ?? 'main'}
+        hasRepo={Boolean(service.repository)}
+      />
+
       <p className="text-[11px] leading-relaxed text-faint">
-        Deploys <code className="font-mono text-muted">{service.branch ?? 'main'}</code> at its latest
-        commit.{' '}
         {service.serviceType === 'backend'
-          ? 'The job is queued for your container host; a redeploy only replaces the running '
-            + 'container once the new one is healthy.'
+          ? 'The job is queued for your container host. A redeploy builds the new commit first '
+            + 'and only tears down the running container once the new one is healthy, so a '
+            + 'failed build leaves the live one untouched.'
           : 'The Vercel project is created in your own account.'}
       </p>
 
@@ -312,6 +376,87 @@ function DeployTab({
   )
 }
 
+/**
+ * What is at the top of the branch, and whether it is already live.
+ *
+ * The point of this card is that "Deploy" is otherwise indistinguishable from a
+ * no-op: without the sha the user cannot tell whether their push has been
+ * picked up. State is conveyed by weight, not hue (see components/ui.tsx) — a
+ * new commit gets the strong border, an up-to-date one stays quiet.
+ */
+function CommitCard({
+  commit, error, branch, hasRepo,
+}: { commit: LatestCommit | null; error: string | null; branch: string; hasRepo: boolean }) {
+  if (!hasRepo) {
+    return (
+      <p className="rounded-lg border border-dashed border-line px-3 py-2 text-[11px] text-faint">
+        Set a repository in Settings before deploying.
+      </p>
+    )
+  }
+  if (error) {
+    return (
+      <p className="rounded-lg border border-dashed border-line px-3 py-2 text-[11px] text-faint">
+        {error} — deploying still works and will use the branch head.
+      </p>
+    )
+  }
+  if (!commit) {
+    return (
+      <div className="flex items-center gap-2 rounded-lg border border-line bg-sunken px-3 py-2 text-[11px] text-faint">
+        <Spinner className="size-3" /> Checking <code className="font-mono">{branch}</code> for new commits…
+      </div>
+    )
+  }
+
+  const behind = !commit.upToDate
+  return (
+    <div
+      className={`rounded-xl border bg-sunken p-3 ${
+        behind ? 'border-line-strong' : 'border-line'
+      }`}
+    >
+      <div className="flex items-center gap-2">
+        <span className="text-[10.5px] font-semibold uppercase tracking-[0.08em] text-faint">
+          {behind ? 'New commit' : 'Up to date'}
+        </span>
+        <code className="ml-auto font-mono text-[11px] text-ink">
+          {commit.branch}@{commit.shortSha}
+        </code>
+        {commit.url && (
+          <a
+            href={commit.url}
+            target="_blank"
+            rel="noreferrer"
+            title="View commit on GitHub"
+            className="grid size-6 shrink-0 place-items-center rounded-md border border-line text-faint transition hover:text-ink"
+          >
+            <GithubMark size={11} />
+          </a>
+        )}
+      </div>
+
+      {commit.message && (
+        <p className="mt-1.5 line-clamp-2 text-[12px] leading-snug text-ink">{commit.message}</p>
+      )}
+      {commit.author && (
+        <p className="mt-1 text-[11px] text-faint">
+          {commit.author}
+          {commit.committedAt && ` · ${new Date(commit.committedAt).toLocaleString()}`}
+        </p>
+      )}
+
+      <p className="mt-2 border-t border-line pt-2 text-[11px] leading-relaxed text-faint">
+        {behind
+          ? commit.deployedShortSha
+            ? <>Live is <code className="font-mono text-muted">{commit.deployedShortSha}</code> — this deploy ships <code className="font-mono text-muted">{commit.shortSha}</code>.</>
+            : <>Nothing deployed yet — this deploy ships <code className="font-mono text-muted">{commit.shortSha}</code>.</>
+          : <>This commit is already deployed. Deploying again rebuilds it.</>}
+      </p>
+    </div>
+  )
+}
+
 /* ------------------------------------------------- connection: container host */
 
 /**
@@ -319,7 +464,9 @@ function DeployTab({
  * connect — only whether the Container Management Service is configured and
  * answering. Showing the Vercel panel here would be actively misleading.
  */
-function ContainerTargetTab() {
+function ContainerTargetTab({
+  projectId, service, onSaved,
+}: { projectId: string; service: Service; onSaved: (s: Service) => void }) {
   const [target, setTarget] = useState<ContainerTarget | null>(null)
   const [notConfigured, setNotConfigured] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
@@ -380,6 +527,8 @@ function ContainerTargetTab() {
         )}
       </Section>
 
+      <LinkedDatabases projectId={projectId} service={service} onSaved={onSaved} />
+
       <Section title="GitHub">
         <div className="flex items-start gap-2.5 rounded-xl border border-line bg-sunken p-3.5">
           <span className="mt-0.5 shrink-0 text-muted"><GithubMark /></span>
@@ -397,7 +546,9 @@ function ContainerTargetTab() {
 
 /* ------------------------------------------------------ connection: Vercel */
 
-function ConnectionTab() {
+function ConnectionTab({
+  projectId, service, onSaved,
+}: { projectId: string; service: Service; onSaved: (s: Service) => void }) {
   const [connection, setConnection] = useState<Connection | null>(null)
   const [oauthAvailable, setOauthAvailable] = useState(false)
   const [loading, setLoading] = useState(true)
@@ -527,6 +678,8 @@ function ConnectionTab() {
         )}
       </Section>
 
+      <LinkedDatabases projectId={projectId} service={service} onSaved={onSaved} />
+
       <Section title="GitHub">
         <div className="flex items-start gap-2.5 rounded-xl border border-line bg-sunken p-3.5">
           <span className="mt-0.5 shrink-0 text-muted"><GithubMark /></span>
@@ -545,6 +698,358 @@ function ConnectionTab() {
         </div>
       </Section>
     </div>
+  )
+}
+
+/* --------------------------------------------- connection: database node */
+
+/**
+ * A database node holds one credential: the connection string for a store the
+ * user already created at Neon or Atlas. ShipYard never provisions a database —
+ * dropping someone's data on a mis-click is not worth the convenience — so this
+ * tab is about attaching, verifying and detaching that string.
+ *
+ * The string is write-only from the browser's point of view: it goes up, and
+ * only the host/database/user ever come back.
+ */
+function DatabaseConnectionTab({
+  projectId, service, onSaved,
+}: { projectId: string; service: Service; onSaved: (s: Service) => void }) {
+  const [attached, setAttached] = useState<DatabaseAttachment | null>(null)
+  const [provider, setProvider] = useState<DatabaseProvider | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [value, setValue] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [notice, setNotice] = useState<string | null>(null)
+  const [replacing, setReplacing] = useState(false)
+
+  const load = useCallback(async () => {
+    setLoading(true)
+    setError(null)
+    try {
+      const r = await api.databaseConnection(projectId, service.id)
+      setAttached(r as DatabaseAttachment)
+      setProvider((r as DatabaseAttachment).provider)
+    } catch (e) {
+      setAttached(null)
+      // 404 DATABASE_NOT_CONNECTED is the normal empty state, and it carries
+      // the provider descriptor so the form can render without a second call.
+      const body = (e as { body?: { provider?: DatabaseProvider; error?: { code?: string } } }).body
+      if (errCode(e) === 'DATABASE_NOT_CONNECTED' && body?.provider) {
+        setProvider(body.provider)
+      } else {
+        setError(errMessage(e, 'Could not read this database node'))
+      }
+    } finally {
+      setLoading(false)
+    }
+  }, [projectId, service.id])
+
+  useEffect(() => { void load() }, [load])
+
+  async function attach() {
+    setError(null)
+    setNotice(null)
+    setBusy(true)
+    try {
+      const r = await api.attachDatabase(projectId, service.id, value.trim()) as DatabaseAttachment
+      setValue('')
+      setReplacing(false)
+      setAttached(r)
+      setProvider(r.provider)
+      const parts: string[] = []
+      if (r.verification?.method === 'format') {
+        parts.push('Saved. Format looks right — credentials are confirmed the first time a service uses them.')
+      } else {
+        parts.push(`Connected to ${r.database?.name ?? 'the database'}.`)
+      }
+      if (r.resynced?.updated) {
+        parts.push(
+          `${r.resynced.updated} linked ${r.resynced.updated === 1 ? 'service' : 'services'} updated — `
+          + 'redeploy to pick up the new value.',
+        )
+      }
+      for (const w of r.verification?.warnings ?? []) parts.push(w)
+      setNotice(parts.join(' '))
+      // provider_connection_id changed, so the canvas copy of the service is stale.
+      const svc = await api.services(projectId)
+        .then((s) => (s.services as Service[]).find((x) => x.id === service.id))
+        .catch(() => null)
+      if (svc) onSaved(svc)
+    } catch (e) {
+      setError(`${errCode(e) ?? 'Error'} — ${errMessage(e, 'Could not attach that connection string')}`)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function test() {
+    setError(null)
+    setNotice(null)
+    setBusy(true)
+    try {
+      const r = await api.testDatabase(projectId, service.id)
+      if (r.ok) {
+        setNotice(
+          r.verification.method === 'format'
+            ? 'Format is valid. This provider is not live-checked.'
+            : `Reachable — ${r.verification.detail}`,
+        )
+      } else {
+        setError(`${r.error?.code ?? 'Error'} — ${r.error?.message ?? 'Unreachable'}`)
+      }
+    } catch (e) {
+      setError(errMessage(e, 'Could not test the connection'))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function detach() {
+    if (!window.confirm(
+      'Detach this connection string?\n\nThe database itself is untouched. Variables already '
+      + 'injected into linked services are left in place so nothing running breaks.',
+    )) return
+    setBusy(true)
+    try {
+      await api.detachDatabase(projectId, service.id)
+      setAttached(null)
+      setNotice('Detached. The database at your provider was not touched.')
+      const svc = await api.services(projectId)
+        .then((s) => (s.services as Service[]).find((x) => x.id === service.id))
+        .catch(() => null)
+      if (svc) onSaved(svc)
+    } catch (e) {
+      setError(errMessage(e, 'Could not detach'))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  if (loading) {
+    return <div className="flex items-center gap-2 py-6 text-xs text-faint"><Spinner /> Checking…</div>
+  }
+
+  const showForm = !attached || replacing
+
+  return (
+    <div className="space-y-6">
+      <Section title={provider ? `${provider.label} connection` : 'Database connection'}>
+        {attached && (
+          <div className="rounded-xl border border-line bg-sunken p-3.5">
+            <div className="flex items-center gap-2">
+              <span className={`size-2 rounded-full ${attached.decryptable ? 'bg-ink' : 'bg-danger'}`} />
+              <span className="text-[13px] font-semibold text-ink">
+                {attached.decryptable ? 'Attached' : 'Cannot decrypt'}
+              </span>
+              <span className="ml-auto rounded border border-line px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-faint">
+                {attached.provider.kind}
+              </span>
+            </div>
+
+            {attached.database ? (
+              <dl className="mt-2.5 space-y-1 text-[11px]">
+                <Row label="Host" value={attached.database.host} />
+                <Row label="Database" value={attached.database.name ?? '—'} />
+                <Row label="User" value={attached.database.user ?? '—'} />
+              </dl>
+            ) : (
+              <p className="mt-2 text-[11px] leading-relaxed text-danger">
+                This connection string was encrypted with a different TOKEN_ENCRYPTION_KEY.
+                Paste it again to repair it.
+              </p>
+            )}
+
+            <p className="mt-2.5 text-[11px] leading-relaxed text-faint">
+              The password is never returned to the browser. Wire this node to a backend on
+              the canvas to inject the full string as an environment variable.
+            </p>
+
+            <div className="mt-3 flex flex-wrap gap-2">
+              <Button variant="ghost" size="sm" onClick={test} disabled={busy}>
+                {busy ? <><Spinner /> Testing…</> : 'Test connection'}
+              </Button>
+              <Button variant="ghost" size="sm" onClick={() => setReplacing((v) => !v)} disabled={busy}>
+                {replacing ? 'Cancel' : 'Replace'}
+              </Button>
+              <Button variant="danger" size="sm" onClick={detach} disabled={busy}>Detach</Button>
+            </div>
+          </div>
+        )}
+
+        {showForm && provider && (
+          <div className="space-y-3 rounded-xl border border-line bg-sunken p-3.5">
+            {!attached && (
+              <p className="text-[12.5px] leading-relaxed text-muted">
+                Create the database in <strong className="font-semibold text-ink">your own</strong>{' '}
+                {provider.label} account, then paste its connection string here. ShipYard stores it
+                encrypted and never provisions or deletes a database.
+              </p>
+            )}
+            <Field
+              label="Connection string"
+              hint={
+                <>
+                  Copy it from{' '}
+                  <a
+                    className="text-muted underline underline-offset-2 hover:text-ink"
+                    href={provider.consoleUrl}
+                    target="_blank"
+                    rel="noreferrer"
+                  >
+                    {provider.consoleUrl.replace(/^https:\/\//, '')}
+                  </a>
+                  . Encrypted with AES-256-GCM server-side.{' '}
+                  {provider.verifyMethod === 'connect'
+                    ? 'Verified with a real connection before it is saved.'
+                    : 'Checked for format only — no Mongo driver runs in the control plane.'}
+                </>
+              }
+            >
+              <textarea
+                className={`${inputCls} min-h-[70px] resize-y font-mono text-[11px]`}
+                placeholder={provider.placeholder}
+                value={value}
+                onChange={(e) => setValue(e.target.value)}
+                spellCheck={false}
+              />
+            </Field>
+            <Button full disabled={busy || value.trim().length < 12} onClick={attach}>
+              {busy ? <><Spinner /> Verifying…</> : attached ? 'Replace connection string' : 'Attach database'}
+            </Button>
+          </div>
+        )}
+
+        {notice && (
+          <p className="rounded-lg border border-line bg-raised px-3 py-2 text-[11.5px] leading-relaxed text-muted">
+            {notice}
+          </p>
+        )}
+        {error && <p className="rounded-lg bg-danger-soft px-3 py-2 text-xs leading-relaxed text-danger">{error}</p>}
+      </Section>
+
+      <Section title="Engine">
+        <p className="rounded-xl border border-line bg-sunken p-3.5 text-[11px] leading-relaxed text-faint">
+          This node is <strong className="font-medium text-muted">{service.serviceConfig?.engine ?? 'postgres'}</strong>,
+          which maps to {provider?.label ?? 'its provider'}. Change the engine in Settings — the
+          provider follows from it.
+        </p>
+      </Section>
+    </div>
+  )
+}
+
+function Row({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="flex items-baseline gap-2">
+      <dt className="w-16 shrink-0 text-faint">{label}</dt>
+      <dd className="min-w-0 flex-1 truncate font-mono text-muted">{value}</dd>
+    </div>
+  )
+}
+
+/* ------------------------------------------------------- linked databases */
+
+/**
+ * The databases this service reads, and under which variable name.
+ *
+ * Each row is really an `environment_vars` row plus a graph edge, so unlinking
+ * removes both. Rendered on the Connection tab of a consumer (backend or
+ * frontend) — the canvas edge is how you create one, this is how you audit and
+ * undo it.
+ */
+function LinkedDatabases({
+  projectId, service, onSaved,
+}: { projectId: string; service: Service; onSaved: (s: Service) => void }) {
+  const [links, setLinks] = useState<ServiceLink[] | null>(null)
+  const [busy, setBusy] = useState<string | null>(null)
+  const [error, setError] = useState<string | null>(null)
+
+  const load = useCallback(async () => {
+    try {
+      const r = await api.links(projectId, service.id)
+      setLinks((r.links ?? []) as ServiceLink[])
+    } catch {
+      setLinks([])
+    }
+  }, [projectId, service.id])
+
+  useEffect(() => { void load() }, [load])
+
+  async function unlink(link: ServiceLink) {
+    if (!window.confirm(
+      `Remove ${link.varName}?\n\nThe variable is deleted from this service and the edge is `
+      + `removed from the canvas. ${link.kind === 'url'
+        ? 'The service it points at is untouched.'
+        : 'The database itself is untouched.'} Redeploy to apply.`,
+    )) return
+    setBusy(link.providerServiceId)
+    setError(null)
+    try {
+      const r = await api.deleteLink(projectId, service.id, link.providerServiceId)
+      if (r.service) onSaved(r.service as Service)
+      await load()
+    } catch (e) {
+      setError(errMessage(e, 'Could not remove that link'))
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  if (links === null) return null
+
+  return (
+    <Section title="Linked services">
+      {links.length === 0 ? (
+        <p className="rounded-xl border border-dashed border-line bg-sunken p-3.5 text-[11px] leading-relaxed text-faint">
+          Nothing linked. Drag an edge from a database or a deployed backend to this node and
+          ShipYard injects its connection string — or its live URL — as an environment
+          variable here.
+        </p>
+      ) : (
+        <ul className="space-y-2">
+          {links.map((l) => (
+            <li key={l.providerServiceId} className="rounded-xl border border-line bg-sunken p-3">
+              <div className="flex items-center gap-2">
+                <code className="truncate font-mono text-[11.5px] font-medium text-ink">{l.varName}</code>
+                <span className="ml-auto shrink-0 rounded border border-line px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-faint">
+                  {l.kind === 'url' ? (l.providerServiceType ?? 'url') : (l.engine ?? 'db')}
+                </span>
+              </div>
+              <p className="mt-1.5 truncate text-[11px] text-faint">
+                {(l.providerName ?? l.databaseName)
+                  ? <>from <span className="text-muted">{l.providerName ?? l.databaseName}</span></>
+                  : <span className="text-danger">that node was deleted</span>}
+                {l.kind === 'url'
+                  ? l.url && <> · <span className="font-mono">{String(l.url).replace(/^https?:\/\//, '')}</span></>
+                  : l.databaseLabel && <> · <span className="font-mono">{l.databaseLabel}</span></>}
+              </p>
+              {/* A url link goes stale when the provider redeploys to a new
+                  address. The value is refreshed automatically by the next
+                  deploy of THIS service — which is the actionable part, since
+                  build-time variables are baked into the bundle. */}
+              {l.stale && (
+                <p className="mt-2 rounded-lg bg-danger-soft px-2.5 py-1.5 text-[10.5px] leading-relaxed text-danger">
+                  {l.providerName} has moved. Redeploy this service to pick up its new address.
+                </p>
+              )}
+              <div className="mt-2.5">
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => void unlink(l)}
+                  disabled={busy === l.providerServiceId}
+                >
+                  {busy === l.providerServiceId ? <><Spinner /> Removing…</> : 'Unlink'}
+                </Button>
+              </div>
+            </li>
+          ))}
+        </ul>
+      )}
+      {error && <p className="rounded-lg bg-danger-soft px-3 py-2 text-xs text-danger">{error}</p>}
+    </Section>
   )
 }
 

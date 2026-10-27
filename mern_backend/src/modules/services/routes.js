@@ -6,6 +6,7 @@ import { asyncHandler } from '../../utils/asyncHandler.js';
 import { SERVICE_TYPES } from './serviceTypes.js';
 import { listServices, createService, getService, updateService, deleteService, updateServiceCanvas } from './repository.js';
 import { teardownServiceContainers } from '../deployments/service.js';
+import { consumersOfProvider, kindForProviderType } from '../links/service.js';
 
 // NOT NULL in the schema: service_name, service_type, repository, branch,
 // root_directory, service_config. Those can never be patched to null.
@@ -117,11 +118,20 @@ router.delete('/:serviceId', asyncHandler(async (req, res) => {
     serviceType: service.serviceType,
   }).catch((e) => ({ queued: 0, error: e.code ?? 'ERROR' }));
 
+  // Deleting a node leaves whatever it injected — a connection string, or its
+  // own URL — sitting on the services that read it. That is the safe direction
+  // (a running container keeps working) but the user must be told, so report
+  // who still holds a value. Read before the delete, while the links are still
+  // resolvable: ON DELETE CASCADE takes the records with it.
+  const orphanedLinks = kindForProviderType(service.serviceType)
+    ? await consumersOfProvider(req.userId, projectId, serviceId).catch(() => [])
+    : [];
+
   await deleteService(req.userId, projectId, serviceId);
 
   // 200 with a body rather than 204, so the client can see whether a container
   // teardown was queued. A failed teardown does not fail the delete.
-  res.json({ deleted: { id: serviceId }, teardown });
+  res.json({ deleted: { id: serviceId }, teardown, orphanedLinks });
 }));
 
 export default router;

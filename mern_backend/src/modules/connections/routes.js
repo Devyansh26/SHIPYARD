@@ -10,6 +10,7 @@ import { encryptSecret } from '../../utils/crypto.js';
 import {
   createAdapter, createKeylessAdapter, containerTargetConfigured, SUPPORTED_PROVIDERS,
 } from '../providers/index.js';
+import { DATABASE_PROVIDERS, publicProvider } from '../providers/database.js';
 import { listConnections, upsertConnection, revokeConnection, findConnection } from './repository.js';
 
 const STATE_COOKIE = 'vercel_oauth_state';
@@ -75,6 +76,19 @@ router.get('/', requireAuth, asyncHandler(async (req, res) => {
     supported: SUPPORTED_PROVIDERS,
     vercelOAuthAvailable: vercelOAuthConfigured,
   });
+}));
+
+/**
+ * The supported database stores, so the UI can label engines and show the right
+ * console link and placeholder without hardcoding any of it.
+ *
+ * Account-level and credential-free, which is why it lives here rather than
+ * under a service: a user needs this list before any database node exists. The
+ * credential itself is attached per node — see
+ * /api/v1/projects/:p/services/:s/database.
+ */
+router.get('/database-providers', requireAuth, asyncHandler(async (_req, res) => {
+  res.json({ providers: Object.values(DATABASE_PROVIDERS).map(publicProvider) });
 }));
 
 // --- OAuth ("Connect Vercel" button) ----------------------------------------

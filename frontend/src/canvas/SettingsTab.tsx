@@ -256,10 +256,23 @@ export default function SettingsTab({
   async function remove() {
     const extra = kind === 'backend'
       ? ' Any running container is queued for teardown.'
-      : ''
+      : kind === 'database'
+        // The store is the user's and lives at Neon/Atlas — say so explicitly,
+        // because "delete" on a database node reads as destructive.
+        ? ' The database itself is NOT deleted — only this node and its stored'
+          + ' connection string. Services already using it keep their variable.'
+        : ''
     if (!window.confirm(`Delete "${service.name}"?${extra}`)) return
     try {
-      await api.deleteService(projectId, service.id)
+      const r = await api.deleteService(projectId, service.id)
+      const orphaned = (r?.orphanedLinks ?? []) as { serviceName: string; varName: string }[]
+      if (orphaned.length > 0) {
+        window.alert(
+          `Deleted "${service.name}".\n\nThese services still hold its connection string:\n`
+          + orphaned.map((o) => `  • ${o.serviceName} — ${o.varName}`).join('\n')
+          + '\n\nRemove those variables by hand if they are no longer wanted.',
+        )
+      }
       onDeleted(service.id)
     } catch (e) {
       setError(errMessage(e, 'Could not delete this service'))
@@ -287,12 +300,18 @@ export default function SettingsTab({
         <Section title="Engine">
           <Field
             label="Database engine"
-            hint="Stored in service_config.engine. Provisioning adapters (Neon, Atlas) are not wired up yet — this records your intent."
+            hint="The provider follows from this: postgres → Neon, mongodb → MongoDB Atlas. Attach the connection string on the Connection tab."
           >
             <select className={inputCls} value={form.engine} onChange={(e) => set('engine')(e.target.value)}>
               {DB_ENGINES.map((x) => <option key={x} value={x}>{x}</option>)}
             </select>
           </Field>
+          {form.engine !== (service.serviceConfig?.engine ?? 'postgres') && (
+            <p className="rounded-lg border border-line-strong bg-sunken px-3 py-2 text-[11px] leading-relaxed text-muted">
+              Changing the engine changes the provider, so the attached connection string will
+              no longer match. Re-attach it on the Connection tab after saving.
+            </p>
+          )}
         </Section>
       ) : (
         <>
@@ -336,7 +355,10 @@ export default function SettingsTab({
               <Field label="Build command">
                 <input className={inputCls} placeholder="npm run build" value={form.buildCommand} onChange={(e) => set('buildCommand')(e.target.value)} />
               </Field>
-              <Field label="Output directory" hint="dist for Vite, .next for Next.js. Empty uses the preset default.">
+              <Field
+                label="Output directory"
+                hint="dist for Vite. Leave this EMPTY for Next.js — Vercel manages .next itself, and pinning it deploys a build whose pages fail with MIDDLEWARE_INVOCATION_FAILED."
+              >
                 <input className={inputCls} placeholder="dist" value={form.outputDirectory} onChange={(e) => set('outputDirectory')(e.target.value)} />
               </Field>
               <Field label="Start command" hint="The long-running process. Required unless your repository has a Dockerfile with its own CMD.">
