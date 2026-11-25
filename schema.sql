@@ -46,11 +46,22 @@ CREATE TRIGGER trg_users_updated_at
 -- =============================================================================
 -- 3. PROVIDER CONNECTIONS
 -- =============================================================================
--- Stores credentials/authorizations for cloud targets (Vercel, Neon, Atlas, Homelab)
+-- Stores credentials/authorizations for cloud targets (Vercel, Render, Neon,
+-- Atlas, Homelab, Azure).
+--
+-- NOTE: `IF NOT EXISTS` does NOT widen the CHECK on a database that already
+-- has this table, so adding a provider here is not enough for an existing
+-- deployment. Apply this to Neon by hand as well:
+--
+--   ALTER TABLE provider_connections
+--     DROP CONSTRAINT IF EXISTS provider_connections_provider_type_check;
+--   ALTER TABLE provider_connections
+--     ADD CONSTRAINT provider_connections_provider_type_check
+--     CHECK (provider_type IN ('vercel', 'render', 'neon', 'atlas', 'homelab', 'azure'));
 CREATE TABLE IF NOT EXISTS provider_connections (
     connection_id VARCHAR(64) PRIMARY KEY,
     user_id VARCHAR(64) NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
-    provider_type VARCHAR(50) NOT NULL CHECK (provider_type IN ('vercel', 'neon', 'atlas', 'homelab')),
+    provider_type VARCHAR(50) NOT NULL CHECK (provider_type IN ('vercel', 'render', 'neon', 'atlas', 'homelab', 'azure')),
     external_account_id VARCHAR(255),
     credentials_ref TEXT NOT NULL, -- Encrypted format: enc:v1:<iv>:<tag>:<ciphertext>
     connection_status VARCHAR(50) NOT NULL DEFAULT 'active' CHECK (connection_status IN ('active', 'revoked', 'error')),

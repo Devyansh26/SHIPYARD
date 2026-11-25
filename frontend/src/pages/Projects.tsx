@@ -5,11 +5,13 @@ import { errCode, errMessage, type Project, type Repo, type User } from '../lib/
 import { TopBar } from '../components/TopBar'
 import { Button, EmptyState, Field, Spinner } from '../components/ui'
 import { inputCls } from '../lib/meta'
+import CloudProvidersCard from '../integrations/CloudProvidersCard'
 
 export default function Projects({ user, onLogout }: { user: User; onLogout: () => void }) {
   const navigate = useNavigate()
   const [params, setParams] = useSearchParams()
   const vercelFlag = params.get('vercel')
+  const azureFlag = params.get('azure')
   const [projects, setProjects] = useState<Project[]>([])
   const [repos, setRepos] = useState<Repo[]>([])
   const [loading, setLoading] = useState(true)
@@ -83,6 +85,28 @@ export default function Projects({ user, onLogout }: { user: User; onLogout: () 
               : 'Vercel authorization was cancelled.'}
             <button
               onClick={() => { params.delete('vercel'); setParams(params, { replace: true }) }}
+              className="ml-auto text-faint transition hover:text-ink"
+              aria-label="Dismiss"
+            >
+              ✕
+            </button>
+          </div>
+        )}
+
+        {azureFlag && (
+          <div
+            className={`mb-6 flex items-center gap-2.5 rounded-xl border px-3.5 py-2.5 text-[13px] ${
+              azureFlag === 'connected'
+                ? 'border-line bg-sunken text-ink'
+                : 'border-danger/30 bg-danger-soft text-danger'
+            }`}
+          >
+            <span className={`size-2 shrink-0 rounded-full ${azureFlag === 'connected' ? 'bg-ink' : 'bg-danger'}`} />
+            {azureFlag === 'connected'
+              ? 'Microsoft Azure connected. Select your preferred subscription below.'
+              : 'Microsoft Azure authorization was cancelled.'}
+            <button
+              onClick={() => { params.delete('azure'); setParams(params, { replace: true }) }}
               className="ml-auto text-faint transition hover:text-ink"
               aria-label="Dismiss"
             >
@@ -179,6 +203,10 @@ export default function Projects({ user, onLogout }: { user: User; onLogout: () 
               </ul>
             )}
           </section>
+        </div>
+
+        <div className="mt-10">
+          <CloudProvidersCard />
         </div>
       </main>
     </div>

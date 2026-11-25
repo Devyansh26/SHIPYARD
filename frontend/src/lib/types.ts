@@ -38,6 +38,28 @@ export type VercelMeta = {
   target?: 'production' | 'preview'
 }
 
+export type AzureServiceKind = 'app_service' | 'container_apps' | 'static_web_apps'
+
+export type AzureMeta = {
+  serviceKind?: AzureServiceKind
+  subscriptionId?: string | null
+  resourceGroup?: string | null
+  location?: string | null
+  appName?: string | null
+  sku?: string | null
+  runtimeStack?: string | null
+  containerImage?: string | null
+  port?: number | null
+  outputLocation?: string | null
+}
+
+export type AzureSubscription = {
+  subscriptionId: string
+  displayName: string
+  state: string
+  tenantId?: string | null
+}
+
 /** service_config.links — one entry per database this service reads. */
 export type ServiceLinkMeta = {
   /** Absent on records written before url links existed — those are databases. */
@@ -66,8 +88,12 @@ export type Service = {
   startCommand: string | null
   serviceConfig: {
     canvas?: CanvasMeta
+    /** selected deployment provider override ('vercel' | 'container' | 'azure') */
+    provider?: 'vercel' | 'container' | 'azure'
     /** frontend services only */
     vercel?: VercelMeta
+    /** azure deployments (frontend or backend) */
+    azure?: AzureMeta
     /** backend services only */
     container?: ContainerMeta
     /** database services only */

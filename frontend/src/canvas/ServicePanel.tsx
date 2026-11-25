@@ -11,6 +11,7 @@ import { CloseIcon, ExternalIcon, GithubMark, TYPE_ICON, VercelMark } from '../c
 import { TYPE_META, inputCls } from '../lib/meta'
 import EnvVarsTab from './EnvVarsTab'
 import SettingsTab from './SettingsTab'
+import AzureConnect from '../integrations/AzureConnect'
 
 type Tab = 'settings' | 'env' | 'deploy' | 'connection'
 
@@ -129,9 +130,11 @@ function PanelBody({
           service.serviceType === 'database'
             // A database node connects to Neon/Atlas, not to a deploy target.
             ? <DatabaseConnectionTab projectId={projectId} service={service} onSaved={onSaved} />
-            : service.serviceType === 'backend'
-              ? <ContainerTargetTab projectId={projectId} service={service} onSaved={onSaved} />
-              : <ConnectionTab projectId={projectId} service={service} onSaved={onSaved} />
+            : service.serviceConfig?.provider === 'azure'
+              ? <AzureConnectionTab projectId={projectId} service={service} onSaved={onSaved} />
+              : service.serviceType === 'backend'
+                ? <ContainerTargetTab projectId={projectId} service={service} onSaved={onSaved} />
+                : <ConnectionTab projectId={projectId} service={service} onSaved={onSaved} />
         )}
       </div>
     </>
@@ -211,6 +214,9 @@ function DeployTab({
       const code = errCode(e)
       if (code === 'VERCEL_NOT_CONNECTED') {
         setError('Connect your Vercel account first.')
+        onNeedConnection()
+      } else if (code === 'AZURE_NOT_CONNECTED' || code === 'AZURE_SUBSCRIPTION_REQUIRED') {
+        setError('Connect your Microsoft Azure account and select a subscription first.')
         onNeedConnection()
       } else if (code === 'CONTAINER_TARGET_NOT_CONFIGURED') {
         setError(errMessage(e, 'The container host is not configured on this server.'))
@@ -540,6 +546,21 @@ function ContainerTargetTab({
           </p>
         </div>
       </Section>
+    </div>
+  )
+}
+
+/* ------------------------------------------------------- connection: Azure */
+
+function AzureConnectionTab({
+  projectId, service, onSaved,
+}: { projectId: string; service: Service; onSaved: (s: Service) => void }) {
+  return (
+    <div className="space-y-6">
+      <Section title="Microsoft Azure">
+        <AzureConnect />
+      </Section>
+      <LinkedDatabases projectId={projectId} service={service} onSaved={onSaved} />
     </div>
   )
 }

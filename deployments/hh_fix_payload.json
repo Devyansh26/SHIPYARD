@@ -1,0 +1,23 @@
+{
+  "deploymentId": "dep_hh_fix_001",
+  "serviceId": "svc_hh_fix",
+  "projectId": "prj_hh_fix",
+  "commitSha": "HEAD",
+  "branch": "main",
+  "configSnapshot": {
+    "service_id": "svc_hh_fix",
+    "project_id": "prj_hh_fix",
+    "service_name": "hack-heaven",
+    "service_type": "backend",
+    "repository": "https://github.com/Devyansh26/Hack-heaven-backend.git",
+    "branch": "main",
+    "root_directory": ".",
+    "build_command": null,
+    "pre_deploy_command": "pip install -r requirements.txt",
+    "start_command": "python -c \"from app import app; app.run(host='0.0.0.0', port=5000)\"",
+    "env_vars": [],
+    "ports": [{"containerPort": 5000, "protocol": "tcp"}],
+    "resources": null,
+    "health_check": null
+  }
+}
