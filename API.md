@@ -7,7 +7,7 @@ This document describes **the code as it is**, not the design intent in `docs/`
 (which still describes a MongoDB/TypeScript stack that was never built). Where
 something is half-built, it says so — see [Known gaps](#known-gaps).
 
-Last verified against the tree on **2026-10-27**.
+Last verified against the tree on **2026-11-25**.
 
 ---
 
@@ -32,7 +32,7 @@ Last verified against the tree on **2026-10-27**.
 | Service | Directory | Port | Runtime | Role |
 |---|---|---|---|---|
 | **Frontend** | `frontend/` | 5173 | React 19 + Vite | SPA. Talks only to the Control API, through Vite's `/api` proxy. |
-| **Control API** | `mern_backend/` | 3001 | Node ESM + Express + `pg` | The only public backend. Auth, projects, services, env vars, links, deployment orchestration. |
+| **Control API** | `mern_backend/` | 3001 | Node ESM + Express + `pg` | The only public backend. Auth, projects, services, env vars, links, deployment orchestration (Vercel, Render, Railway, containers). |
 | **CMS** | `container_management/` | 8000 | FastAPI | Enqueues container jobs onto Redis. Owns replace/cutover bookkeeping. Never touches Docker. |
 | **CDS** | `container_deploy/` | 8002 | FastAPI + asyncpg | The worker. `BLPOP`s the queue, clones, builds, runs containers, writes state to Postgres. |
 
@@ -43,14 +43,14 @@ authenticate with shared secrets.
 
 ## Counts at a glance
 
-### Endpoints this platform exposes — **64**
+### Endpoints this platform exposes — **75**
 
 | Service | Session auth | Internal (shared secret) | Unauthenticated | Total |
 |---|---|---|---|---|
-| Control API | 44 | 2 | 4 | **50** |
+| Control API | 55 | 2 | 4 | **61** |
 | CMS | 0 | 4 | 2 | **6** |
 | CDS | 0 | 6 | 2 | **8** |
-| **Total** | **44** | **12** | **8** | **64** |
+| **Total** | **55** | **12** | **8** | **75** |
 
 The 8 unauthenticated endpoints are six `/health` + `/ready` liveness probes
 (two per service) and the two GitHub OAuth entry points, which cannot require a
@@ -58,12 +58,14 @@ session because they are what establishes one. Every other Control API endpoint
 is behind the session cookie; every CMS and CDS endpoint that does real work is
 behind a shared secret.
 
-### Third-party endpoints consumed — **20**
+### Third-party endpoints consumed — **33**
 
 | Provider | Endpoints | Transport |
 |---|---|---|
 | GitHub | 6 | HTTPS REST (+1 browser redirect for OAuth authorize) |
 | Vercel | 14 | HTTPS REST (+1 browser redirect for integration install) |
+| Render | 12 | HTTPS REST — **no browser redirect**: Render has no third-party OAuth app programme, so the credential is a pasted API key |
+| Railway | **1** | HTTPS **GraphQL** — one endpoint carrying 15 operations. No browser redirect; the credential is a pasted API token |
 | MongoDB Atlas | **0** | none — connection strings are format-checked only, never dialled |
 | Neon / Postgres | 0 | not HTTP — the Postgres wire protocol, see below |
 
@@ -88,8 +90,12 @@ behind a shared secret.
              ▼
     ┌─────────────────────┐        user's own GitHub ──┐
     │   Control API :3001 │◄───────────────────────────┤
-    │   (the only public  │        user's own Vercel ──┤  external
-    │    backend)         │◄───────────────────────────┤
+    │   (the only public  │        user's own Vercel ──┤
+    │    backend)         │◄───────────────────────────┤  external
+    │                     │        user's own Render ──┤
+    │                     │◄───────────────────────────┤
+    │                     │       user's own Railway ──┤
+    │                     │◄───────────────────────────┤
     └──────┬──────────────┘        user's own Neon ────┘
            │        │
            │        └──────────────► Postgres (platform DB, Neon)
@@ -139,9 +145,28 @@ The GitHub token **never** reaches the browser: `toCamelUser()` strips
 
 ### 2. Deploying a `frontend` → Vercel (synchronous)
 
-Chosen by `service_type`. The mapping lives in `SERVICE_TARGETS`
-(`mern_backend/src/modules/providers/index.js`) and nowhere else — callers ask
-`targetForServiceType()` rather than branching on type.
+#### How a target is chosen
+
+The registry lives in `mern_backend/src/modules/providers/index.js` and nowhere
+else — `PROVIDER_TARGETS` (what each target is) and `SERVICE_TARGETS` (which
+targets a type allows):
+
+| `service_type` | allowed targets | fallback |
+|---|---|---|
+| `frontend` | `vercel` | `vercel` |
+| `backend` | `container`, `render`, `railway` | `container` |
+| `database` | — not deployable | — |
+
+A `backend` has **three** homes, so the choice is per service in
+`service_config.deployTarget` and callers ask **`targetForService(serviceRow)`**,
+not `targetForServiceType()`. None of them is a default: the canvas asks which to
+use when the node is created and writes the answer explicitly. The fallback
+applies only to services created before that picker existed.
+
+An existing deployment is always polled, logged and cancelled through the
+provider recorded in **its own** `config_snapshot.provider.type`, never the
+service's current setting — otherwise retargeting a service would orphan its
+in-flight deployment.
 
 ```
 POST /api/v1/projects/:p/services/:s/deployments
@@ -169,7 +194,101 @@ Status is **pulled lazily**: every read of a non-terminal row calls
 > `ensureProject` now diffs the five fields ShipYard owns and PATCHes what
 > changed.
 
-### 3. Deploying a `backend` → container (asynchronous)
+### 3. Deploying a `backend` → Render (synchronous)
+
+Same shape as Vercel — a per-user credential, a synchronous call, lazily pulled
+status — with two differences that drive the step order.
+
+```
+POST /api/v1/projects/:p/services/:s/deployments
+  1. INSERT deployments row (status=queued → validating)
+  2. resolve git with the user's GitHub token (branch HEAD sha)
+  3. refreshUrlLinks() + loadEnvForDeploy()   ← BEFORE ensureProject, see below
+  4. ensureProject()
+        GET  /v1/services?name=&ownerId=      → exists? (or by stored serviceId)
+        POST /v1/services                     → create, WITH envVars inline
+                                                 └─ answers { service, deployId }
+        PATCH /v1/services/{id}               → or push only changed settings
+  5. syncEnv()  — PUT /v1/services/{id}/env-vars/{key}, one key at a time
+                  SKIPPED when the service was just created
+  6. POST /v1/services/{id}/deploys           → or adopt step 4's deployId
+  7. UPDATE deployments row (status, url)
+```
+
+> **Why env vars are resolved before `ensureProject`.** `POST /v1/services`
+> creates the service **and starts its first build**, returning that build's
+> `deployId`. Anything pushed afterwards would miss it, so the variables go into
+> the create payload — which means they must already be loaded. For the same
+> reason `deploy()` **adopts** that `deployId` instead of triggering a second
+> build of the same commit.
+
+**Public URL** is `<name>.onrender.com`, read from `serviceDetails.url` on the
+**service** rather than the deploy, so it is stable across redeploys and safe to
+hand to a linked frontend.
+
+**Only the settings ShipYard owns are pushed**, and only when they differ:
+runtime, plan, health-check path, build/start/pre-deploy commands, branch,
+`rootDir`, `autoDeployTrigger`. Disks, autoscaling, custom domains and anything
+else set in Render's dashboard are never sent. `region` is sent **only at
+creation** — Render cannot move a service between regions, so a changed region
+is reported as a warning in the snapshot rather than a PATCH that silently does
+nothing.
+
+`autoDeployTrigger` defaults to `off` so ShipYard is the only thing that
+deploys; left on, a `git push` produces a Render deploy with no ShipYard row.
+
+Full detail — the status FSM, the list-envelope quirk, the non-goals — is in
+`mern_backend/src/modules/render/README.md`.
+
+### 4. Deploying a `backend` → Railway (synchronous)
+
+Same gate and shape as Render, with three structural differences that are
+Railway's, not ours.
+
+```
+POST /api/v1/projects/:p/services/:s/deployments
+  1. INSERT deployments row (status=queued -> validating)
+  2. resolve git with the user's GitHub token (branch HEAD sha)
+  3. refreshUrlLinks() + loadEnvForDeploy()
+  4. ensureProject()                         -- all GraphQL, one endpoint
+        project(id)                           -> environments + services
+        resolve environment BY NAME ("production")
+        serviceCreate                         -> or reuse by stored id / name
+        serviceInstanceUpdate                 -> settings, per (service x env)
+        variableCollectionUpsert              -> replace:false, skipDeploys:true
+        domains / serviceDomainCreate         -> mint the public URL
+  5. syncEnv()  -- no-op: step 4 already wrote the variables
+  6. serviceInstanceDeployV2(commitSha)      -> deploy the resolved commit
+     deployments(...)                        -> read back which one it produced
+  7. UPDATE deployments row (status, url)
+```
+
+**1. Settings live on a service *instance*** — the (service × environment) pair
+— so every write needs an `environmentId`. The environment is matched **by
+name**, defaulting to `production`: edge order from the API is not guaranteed,
+and silently deploying into `staging` because it sorted first would be very hard
+to spot.
+
+**2. A Railway service has no public URL until one is created.** Vercel and
+Render hand you a hostname; Railway does not. `serviceDomainCreate` is a
+required step, and skipping it leaves a running service nothing can reach. It is
+idempotent and non-fatal — a deploy that is building fine is never failed
+because the URL could not be minted, and the next deploy retries.
+
+**3. `source.repo` is `owner/repo`, not a URL** — the exact opposite of Render's
+field in the same position. A URL creates a service whose builds fail at clone.
+
+**Public URL** prefers the Railway **service domain** (`*.up.railway.app`),
+which is stable across redeploys, over a deployment's own `url`.
+
+`serviceInstanceDeployV2` returns a value that is not documented as a deployment
+id, so the adapter reads the deployment list back and takes the newest rather
+than trusting it.
+
+Full detail — the GraphQL error model, the status FSM, the non-goals — is in
+`mern_backend/src/modules/railway/README.md`.
+
+### 5. Deploying a `backend` → container (asynchronous)
 
 ```
 POST /api/v1/projects/:p/services/:s/deployments
@@ -202,7 +321,7 @@ Because the hostname is stable, two containers would otherwise answer one `Host`
 rule — so CDS stops and removes the previous container, but **only after the new
 one is proven healthy**. A failed build leaves the running version serving.
 
-### 4. Linking nodes (the canvas edge that writes config)
+### 6. Linking nodes (the canvas edge that writes config)
 
 An edge between two nodes can carry configuration. One POST writes three things
 together:
@@ -246,7 +365,7 @@ callback required.
 ## Control API (`:3001`)
 
 Base path `/api/v1`. Session auth is the `shipyard_session` cookie (httpOnly JWT,
-7 days, no refresh). **50 endpoints.**
+7 days, no refresh). **61 endpoints.**
 
 ### Ops — 2, unauthenticated
 
@@ -282,6 +401,77 @@ Rate limited: 120 req / 15 min across `/auth`, plus 60 / 15 min on the OAuth pai
 | `GET` | `/connections/container` | session | Whether CMS is configured and reachable. `501` if unconfigured. |
 | `DELETE` | `/connections/vercel` | session | Revoke (status → `revoked`, row kept — services reference it). |
 
+Render's connection endpoints are **not** here — they live in their own router
+so the integration stays in one folder. See [Render](#render--5) below.
+
+### Deploy targets — 1
+
+| Method | Path | Auth | Purpose |
+|---|---|---|---|
+| `GET` | `/deploy-targets` | session | Which targets each service type may deploy to, with per-user availability. `?serviceType=backend` narrows it; omitted, it returns every deployable type at once — one request for the whole "Add service" menu. |
+
+Served from the registry in `providers/index.js`, so **the frontend holds no
+provider list of its own** and a target added on the server appears in the
+picker with no frontend change. Each entry carries `label`, `description`,
+`requiresConnection`, `connected` (null for credential-free targets),
+`usable`, and a `reason` when it is not usable yet.
+
+A target that is not usable is **reported, not omitted** — picking Render before
+connecting an account is a legitimate order of operations, and hiding it would
+read as "Render is not supported". A `database` service answers
+`{ deployable: false, targets: [] }` rather than `404`.
+
+### Render — 5
+
+`backend` services can deploy to the user's own Render account. The gate is the
+same as Vercel's: `409 RENDER_NOT_CONNECTED` until a connection exists.
+
+**There is no OAuth authorize/callback pair here.** Render has no third-party
+OAuth app programme, so the credential is an API key the user creates in their
+own Render dashboard and pastes. It is verified against `GET /v1/owners` before
+storage, encrypted AES-256-GCM, and never returned to the browser — the same
+handling as a pasted Vercel token.
+
+| Method | Path | Auth | Purpose |
+|---|---|---|---|
+| `GET` | `/connections/render/options` | session | Runtime / region / plan enums and defaults for the settings form. **Credential-free** — the form needs them before any account is connected. |
+| `GET` | `/connections/render` | session | Connection status plus every workspace the key can reach. `404 RENDER_NOT_CONNECTED` is the normal empty state. A revoked key returns `200` with an `error` field so the UI reads "reconnect" rather than "broken". |
+| `POST` | `/connections/render/key` | session | Paste an API key; optional `ownerId`. Verified before storage. A key reaching exactly one workspace pins it automatically. |
+| `PATCH` | `/connections/render/workspace` | session | Pin which workspace to deploy into, without re-pasting the key. Services already deployed to the previous one keep running there. |
+| `DELETE` | `/connections/render` | session | Revoke. Deployed Render services are **not** touched. |
+
+One API key can reach a personal account (`usr-…`) and several teams (`tea-…`);
+the chosen one lives in `provider_connections.external_account_id`, the same
+column Vercel uses for its team id. With several reachable and none pinned,
+deploying answers `409 RENDER_OWNER_REQUIRED` naming the options rather than
+guessing and creating the service in the wrong team.
+
+### Railway — 5
+
+`backend` services can deploy to the user's own Railway project. Same gate:
+`409 RAILWAY_NOT_CONNECTED` until a connection exists.
+
+Railway's API is **GraphQL only** — but that is entirely server-side; these are
+ordinary REST endpoints on the Control API. The credential is an account or
+workspace token the user pastes. A **project token will not work**: it
+authenticates with a different header and is scoped to one environment, so it
+cannot list the projects ShipYard needs to choose from.
+
+| Method | Path | Auth | Purpose |
+|---|---|---|---|
+| `GET` | `/connections/railway/options` | session | Region / restart-policy enums and defaults. **Credential-free.** |
+| `GET` | `/connections/railway` | session | Connection status plus every project the token can reach. `404 RAILWAY_NOT_CONNECTED` is the normal empty state; a revoked token returns `200` with an `error` field so the UI reads "reconnect". |
+| `POST` | `/connections/railway/token` | session | Paste a token; optional `projectId`. Verified with a `me` query before storage. One project visible → pinned automatically. |
+| `PATCH` | `/connections/railway/project` | session | Pin which project to deploy into. Services already created in the previous one keep running there. |
+| `DELETE` | `/connections/railway` | session | Revoke. Deployed Railway services are **not** touched. |
+
+Unlike Render, what is pinned is a **project**, not a workspace: Railway nests
+services inside a project, so one must be chosen before anything can be created.
+With several visible and none pinned, deploying answers
+`409 RAILWAY_PROJECT_REQUIRED` naming the options. A token that can see no
+projects answers `409 RAILWAY_NO_PROJECTS` — ShipYard deliberately does not
+create one, so that it never owns anything in the user's account.
+
 ### Projects — 5
 
 | Method | Path | Purpose |
@@ -297,9 +487,9 @@ Rate limited: 120 req / 15 min across `/auth`, plus 60 / 15 min on the OAuth pai
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` | `/projects/:p/services` | List. |
-| `POST` | `/projects/:p/services` | Create. `serviceType` ∈ `frontend \| backend \| database`. |
+| `POST` | `/projects/:p/services` | Create. `serviceType` ∈ `frontend \| backend \| database`. A `serviceConfig.deployTarget` the type does not allow is rejected with `400 INVALID_DEPLOY_TARGET`. |
 | `GET` | `/projects/:p/services/:s` | One service. Secret-looking `service_config` keys redacted. |
-| `PATCH` | `/projects/:p/services/:s` | Update. `service_type` is immutable; `service_config` is **replaced**, not merged. |
+| `PATCH` | `/projects/:p/services/:s` | Update. `service_type` is immutable; `service_config` is **replaced**, not merged. `deployTarget` is validated against the stored service type — retargeting a backend between `container` and `render` happens here. |
 | `PATCH` | `/projects/:p/services/:s/canvas` | Node position + `dependsOn`. Merged server-side so siblings survive. |
 | `DELETE` | `/projects/:p/services/:s` | Delete. Queues container teardown first, and returns `orphanedLinks` — who still holds a value it injected. |
 
@@ -307,12 +497,12 @@ Rate limited: 120 req / 15 min across `/auth`, plus 60 / 15 min on the OAuth pai
 
 | Method | Path | Purpose |
 |---|---|---|
-| `POST` | `/projects/:p/services/:s/deployments` | Trigger. Routes by `service_type`. |
-| `GET` | `/projects/:p/services/:s/deployments` | History. Lazily syncs non-terminal rows from the provider. |
+| `POST` | `/projects/:p/services/:s/deployments` | Trigger. Routes by `service_type`, and for a `backend` by its `service_config.deployTarget`. |
+| `GET` | `/projects/:p/services/:s/deployments` | History. Lazily syncs non-terminal rows from whichever provider the row's own snapshot names. |
 | `GET` | `/projects/:p/services/:s/deployments/latest-commit` | Branch HEAD + whether it is already deployed. Hits GitHub, so kept off the build poll. |
 | `GET` | `/deployments/:id` | One deployment (ids are globally unique). |
-| `GET` | `/deployments/:id/logs` | Build logs (Vercel) or container logs (CDS). |
-| `POST` | `/deployments/:id/cancel` | Cancel in flight. |
+| `GET` | `/deployments/:id/logs` | Build + runtime logs (Vercel `/events`; Render `/v1/logs` scoped to the deploy's build and time window; Railway `buildLogs` + `deploymentLogs`). Answers `{ logs, note }` — the note says *why* a log view is empty rather than leaving it blank. Container deployments always return the note: CDS holds their output. |
+| `POST` | `/deployments/:id/cancel` | Cancel in flight. Vercel and Render cancel provider-side; a container job already claimed may still finish. |
 
 ### Environment variables — 6
 
@@ -443,6 +633,97 @@ Plus one browser redirect to `vercel.com/integrations/{slug}/new`.
 `401` → `VERCEL_UNAUTHORIZED` ("Reconnect Vercel"), `402`, `403`, `404`, `409`,
 `429` map to themselves; anything else → `502 VERCEL_API_ERROR`.
 
+### Render — 12 endpoints
+
+Called with the user's API key against `api.render.com/v1`. Scoped to one
+workspace ("owner"), which is only needed when listing or creating — a service
+id already identifies its workspace.
+
+| Method | Endpoint | Used for |
+|---|---|---|
+| `GET` | `/v1/owners` | Verify a key; resolve identity and the workspace list. |
+| `GET` | `/v1/services` | Find the service by name (`?name=&type=web_service&ownerId=`). |
+| `GET` | `/v1/services/{id}` | Authoritative lookup by stored id; read the public URL. |
+| `POST` | `/v1/services` | Create — **and start the first build**. Answers `{ service, deployId }`. |
+| `PATCH` | `/v1/services/{id}` | Push only the changed managed settings. |
+| `POST` | `/v1/services/{id}/deploys` | Trigger a deploy (`commitId`, `clearCache`). |
+| `GET` | `/v1/services/{id}/deploys/{deployId}` | Poll status. |
+| `POST` | `/v1/services/{id}/deploys/{deployId}/cancel` | Cancel. |
+| `GET` | `/v1/services/{id}/env-vars` | Existing variables, for created-vs-updated accounting. |
+| `PUT` | `/v1/services/{id}/env-vars/{key}` | Upsert **one** key. |
+| `DELETE` | `/v1/services/{id}/env-vars/{key}` | Remove a managed key. |
+| `GET` | `/v1/logs` | Build and runtime logs (`ownerId` required, `resource=<serviceId>`). |
+
+No browser redirect: Render has no third-party OAuth app programme.
+
+Two shape quirks the client depends on:
+
+1. **List routes wrap their payload** — `[{ "service": {...}, "cursor": "…" }]`,
+   not a bare array. Single-resource `GET`s return the object bare. Everything
+   list-shaped goes through `unwrap()`.
+2. `POST /v1/services` both creates and deploys, which is why `ensureProject`
+   returns its `deployId` for `deploy()` to adopt.
+
+Deliberately **not** used: the bulk `PUT /v1/services/{id}/env-vars`, which
+replaces the entire set and would delete variables the user added in Render's
+dashboard. Keys ShipYard does not manage are never touched.
+
+`401` → `RENDER_UNAUTHORIZED` ("Reconnect Render"), `400`, `402`, `403`, `404`,
+`409`, `429` map to themselves; anything else → `502 RENDER_API_ERROR`; a
+transport failure → `504 RENDER_UNREACHABLE`. Render's error envelope is
+inconsistent (`{message}`, `{error}`, or `{errors:[…]}`), so all three are tried
+before falling back to the status code.
+
+### Railway — 1 endpoint, 15 GraphQL operations
+
+Railway has **no REST API**: every call is a POST to
+`backboard.railway.com/graphql/v2` with the user's token as a bearer. Counted as
+one endpoint above because that is literally what it is.
+
+| Operation | Used for |
+|---|---|
+| `projects` | **Validates the token** and lists the projects for the picker. |
+| `me` | Email on the Connection tab only. Account-token-only — a *workspace* token is refused here and that is not an error, which is why the gate is `projects`. |
+| `project(id)` | Environments and services in one call. |
+| `serviceCreate` | Create the service from `owner/repo`. |
+| `serviceInstanceUpdate` | Push the settings ShipYard owns, per (service × environment). |
+| `serviceInstanceDeployV2` | Deploy a **specific commit**. |
+| `deployments` | Status poll; resolve which deployment a trigger produced. |
+| `deploymentCancel` | Cancel. |
+| `buildLogs` | Build output for one deployment. |
+| `deploymentLogs` | Runtime output for one deployment. |
+| `variables` | Existing variables. |
+| `variableCollectionUpsert` | Upsert variables (`replace: false`, `skipDeploys: true`). |
+| `variableDelete` | Remove a managed key. |
+| `domains` | Does the service have a public URL? |
+| `serviceDomainCreate` | Mint one. **No Vercel/Render equivalent** — required, or the service is unreachable. |
+
+**The thing most likely to bite: errors arrive in an HTTP 200.** A bad token
+answers `200 OK` with
+`{"errors":[{"message":"Not Authorized",...}],"data":null}`. A client checking
+only `res.ok` treats that as success and then crashes on undefined data, so
+`client.js` checks `body.errors` **first**. Note that `extensions.code` reads
+`INTERNAL_SERVER_ERROR` even for an auth failure, which is why the mapping reads
+the message text rather than that field. A response can also carry both `data`
+and `errors`; any `errors` entry is treated as a failure rather than using half
+a result.
+
+`replace: false` on `variableCollectionUpsert` is deliberate — `true` would
+delete every variable the user set in Railway's own dashboard.
+
+**Token types matter.** An **account** token (dropdown left on "No workspace")
+and a **workspace** token both work. A **project** token does not: Railway makes
+those read-only and expects them on a `Project-Access-Token` header. All three
+wrong cases — plus a truncated paste and a genuinely revoked token — answer the
+same "Not Authorized", so `RAILWAY_UNAUTHORIZED` names the possibilities instead
+of asserting the token is invalid.
+
+**Rate limits are low**: 100 requests/hour on the free plan, 1000/hour on Hobby.
+A deploy costs roughly 6–8 operations. `429` → `RAILWAY_RATE_LIMITED` with the
+retry hint; `401`/"Not Authorized" → `RAILWAY_UNAUTHORIZED`; "not found" →
+`RAILWAY_NOT_FOUND`; anything else → `502 RAILWAY_API_ERROR`; a transport
+failure → `504 RAILWAY_UNREACHABLE`.
+
 ### MongoDB Atlas — 0 endpoints
 
 Deliberate and worth being explicit about: there is **no Mongo driver in the
@@ -518,14 +799,21 @@ Subcommands: `build`, `run`, `ps`, `inspect`, `logs`, `exec`, `stop`, `rm`, plus
 | → CDS REST | shared secret, constant-time compare | **`X-API-Key`** |
 | Control API → GitHub | user's OAuth token (encrypted at rest) | `Authorization: Bearer` |
 | Control API → Vercel | user's token (encrypted at rest) | `Authorization: Bearer` |
+| Control API → Render | user's API key (encrypted at rest) | `Authorization: Bearer` |
+| Control API → Railway | user's account/workspace token (encrypted at rest) | `Authorization: Bearer` |
 
 The two internal headers are **not interchangeable**. Three secrets must line
 up: Control API `CMS_INTERNAL_KEY` ↔ CMS `INTERNAL_API_KEY`, and Control API
 `INTERNAL_API_KEY` (defaults to `CMS_INTERNAL_KEY`) ↔ CMS `CONTROL_PLANE_KEY`.
 
-All stored secrets — GitHub tokens, provider credentials, env var values,
-database connection strings — share one AES-256-GCM format:
-`enc:v1:<iv>:<tag>:<ciphertext>`.
+All stored secrets — GitHub tokens, provider credentials (Vercel tokens, Render
+API keys), env var values, database connection strings — share one AES-256-GCM
+format: `enc:v1:<iv>:<tag>:<ciphertext>`.
+
+Only two of the three provider targets need a user credential at all. The
+container host is ShipYard's own infrastructure, so it has no per-user secret —
+just the shared `X-Internal-Key`. That is the one real difference the deployment
+orchestration branches on (`requiresConnection`).
 
 ---
 
@@ -581,17 +869,67 @@ the snake_case names and passes `ports`/`resources` through as untyped dicts.
 
 **5. Ports, resource limits and health checks have no columns.** They live in
 `service_config.container`, read by `containerConfig()`, defaulting to one port
-on 3000.
+on 3000. The Render equivalents live in `service_config.render` — and Render
+takes neither ports nor resource limits, because it assigns the port itself and
+bills resources by plan.
 
-**6. Not built at all:** custom domains, SSE log streaming, a `/graph` endpoint,
-and the `homelab` adapter.
+**6. The `provider_connections` CHECK needs a hand-written `ALTER` per provider,
+and `schema.sql` is not authoritative about its contents.** The DDL is
+`IF NOT EXISTS`-guarded, so re-applying it does **not** widen the constraint on
+an existing database — `mern_backend/src/modules/railway/migration.sql` (one
+file, every provider) must be run once, or connecting fails with
+`23514 check_violation`.
 
-**7. No test runner in `mern_backend/` or `frontend/`.** Verification there is
+More subtly: the live constraint had drifted from the committed one. It
+contained **`azure`**, with an active row, while nothing in this repository
+references that provider — added to the database by hand. A migration listing
+only the providers the code knows about would have dropped it, failed
+revalidation against that row and rolled back. So the committed list is the
+*union* of code and database, and the migration carries a pre-flight `DO` block
+that names any offending value rather than leaving Postgres to answer "is
+violated by some row". **Read the live constraint before writing the next
+one.**
+
+**7. ShipYard never deletes a provider-hosted service.** Deleting a canvas node
+leaves the Render or Railway service running in the user's own account, and the
+confirm dialog says so — the same stance as a `database` node. Removing it is a
+dashboard action there. ShipYard also never *creates* a Railway project, so a
+token that can see none answers `409 RAILWAY_NO_PROJECTS` rather than making
+one. Container teardown, by contrast, *is* queued (see gap 2 for why nothing
+pops it).
+
+**8. Render region is immutable.** Render cannot move a service between regions,
+so a changed `region` on an existing service is reported as a warning in the
+deployment snapshot rather than applied. Relocating means deleting the Render
+service and deploying again.
+
+**9. Railway has no pre-deploy step.** Its API exposes no equivalent, so
+`pre_deploy_command` does not apply to that target — the Settings tab says so
+instead of showing a field that silently does nothing. Migrations have to run
+from the start command. Render and the container host both honour it.
+
+**10. Railway's rate limits are low enough to matter.** 100 requests/hour on the
+free plan, and one deploy costs roughly 6–8 GraphQL operations. Nothing in the
+Control API throttles or queues against that; a burst of deploys will start
+answering `429 RAILWAY_RATE_LIMITED`.
+
+**11. Not built at all:** custom domains, SSE log streaming, a `/graph`
+endpoint, the `homelab` adapter; Render blueprints (`render.yaml`), disks,
+autoscaling and preview environments; Railway volumes, cron services, private
+networking, PR environments and `railway.json` config-as-code.
+
+**12. No test runner in `mern_backend/` or `frontend/`.** Verification there is
 manual (`mern_backend/tests.http`, or curl with a cookie jar). The two Python
 services do have suites: CMS 51 cases, CDS 75 — all mocked, no Redis or
-credentials needed.
+credentials needed. The Render integration is therefore covered only by `tsc -b`,
+`oxlint` and manual probing.
 
-**8. `repo` scope is read/write.** The landing page claims "No write access to
+**13. Private repos need GitHub connected inside the provider.** Render and
+Railway each clone with *their own* GitHub authorisation; ShipYard's token only
+lists branches and resolves the commit. Without that, the build fails at clone.
+Each Connection tab says so, but nothing checks it up front.
+
+**14. `repo` scope is read/write.** The landing page claims "No write access to
 your code", which is inaccurate: GitHub's `repo` scope grants push access, and
 OAuth Apps have no read-only private-repo alternative (that requires a GitHub
 App). Either the copy or the auth model should change.

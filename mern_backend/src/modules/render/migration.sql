@@ -1,0 +1,19 @@
+-- SUPERSEDED - run `../railway/migration.sql` instead.
+--
+--   psql "$DATABASE_URL" -f mern_backend/src/modules/railway/migration.sql
+--
+-- This file deliberately contains NO statements: running it is a harmless
+-- no-op rather than something that could half-apply or conflict.
+--
+-- Why there is only one migration file for every provider: the constraint is a
+-- single `IN (...)` list, so each provider's migration has to restate ALL of
+-- them. Two files drift, and whichever you run second silently drops what the
+-- other added - that is a real failure mode, not a hypothetical one. The
+-- Railway file is the single current list, is safe to re-run, and carries a
+-- pre-flight guard that names any `provider_type` already in the table that
+-- the new list would reject.
+--
+-- That guard exists because this exact thing happened: the live database's
+-- constraint contained 'azure' with an active row, while nothing in this
+-- repository references that provider. An earlier version of this file listed
+-- only the providers the code knew about, and would have dropped it.

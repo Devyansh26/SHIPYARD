@@ -142,3 +142,21 @@ export function VercelMark({ size = 13, className }: IconProps) {
     </svg>
   )
 }
+
+/** Railway's mark, reduced to a monochrome glyph like the rest of this file. */
+export function RailwayMark({ size = 13, className }: IconProps) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="currentColor" className={className} aria-hidden>
+      <path d="M1.5 9.4h14.2a4.3 4.3 0 0 0-4.2-3.3H1.5v3.3Zm0 2.1v3.3h21v-3.3h-21Zm0 5.4v3.3h10a4.3 4.3 0 0 0 4.2-3.3H1.5Z" />
+    </svg>
+  )
+}
+
+/** Render's mark, reduced to a monochrome glyph like the rest of this file. */
+export function RenderMark({ size = 13, className }: IconProps) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="currentColor" className={className} aria-hidden>
+      <path d="M3 3h7.5v4.2H3V3Zm0 6.9h7.5V21H3V9.9Zm10.5 0H21V21h-7.5V9.9Zm0-6.9H21v4.2h-7.5V3Z" />
+    </svg>
+  )
+}

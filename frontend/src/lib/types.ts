@@ -38,6 +38,138 @@ export type VercelMeta = {
   target?: 'production' | 'preview'
 }
 
+/**
+ * Where a service deploys. Held at the top level of `service_config` rather
+ * than inside a provider block, because it is the thing that decides WHICH
+ * provider block applies.
+ *
+ * Deliberately a plain `string`, not a union of the targets that exist today.
+ * The list is served by `GET /api/v1/deploy-targets` from the registry in
+ * `providers/index.js`, so adding Railway there must not require editing this
+ * file — a union here would turn a backend-only change into a frontend change
+ * and a type error.
+ *
+ * Absent means the service type's default (`container` for a backend) — which
+ * now only happens for services created before the picker existed. Every new
+ * node stores an explicit choice.
+ */
+export type DeployTarget = string
+
+/** One option in the target picker, as served by GET /api/v1/deploy-targets. */
+export type DeployTargetOption = {
+  deployTarget: DeployTarget
+  provider: string
+  label: string
+  description: string
+  requiresConnection: boolean
+  /** What a legacy service with no stored choice resolves to — not a pre-selection. */
+  isDefault: boolean
+  /** False when it cannot be deployed to yet; `reason` says why. Never hidden. */
+  usable: boolean
+  /** Null for targets needing no credential (the container host). */
+  connected: boolean | null
+  reason: string | null
+}
+
+/** service_config.render — mirrors Render's create-service contract. */
+export type RenderMeta = {
+  runtime?: string | null
+  region?: string | null
+  plan?: string | null
+  healthCheckPath?: string | null
+  autoDeployTrigger?: 'off' | 'commit' | 'checksPass' | null
+  dockerfilePath?: string | null
+  dockerContext?: string | null
+  /** Written back by the control plane once Render has created the service. */
+  serviceId?: string | null
+  serviceName?: string | null
+}
+
+/** The enum lists and defaults the Render settings form renders. */
+export type RenderOptions = {
+  runtimes: string[]
+  regions: string[]
+  plans: string[]
+  autoDeployTriggers: ('off' | 'commit' | 'checksPass')[]
+  defaults: {
+    runtime: string
+    region: string
+    plan: string
+    autoDeployTrigger: string
+    healthCheckPath: string
+  }
+  consoleUrl: string
+  apiKeyUrl: string
+}
+
+/** One Render workspace an API key can reach ("owner" in their API). */
+export type RenderWorkspace = {
+  id: string
+  name: string
+  type: 'user' | 'team'
+  email?: string | null
+}
+
+/** service_config.railway — mirrors Railway's ServiceInstanceUpdateInput. */
+export type RailwayMeta = {
+  region?: string | null
+  healthcheckPath?: string | null
+  numReplicas?: number | null
+  restartPolicyType?: 'ON_FAILURE' | 'ALWAYS' | 'NEVER' | null
+  sleepApplication?: boolean | null
+  /** Which Railway environment to deploy into; projects start with "production". */
+  environmentName?: string | null
+  /** The port the generated domain routes to. Null lets Railway infer it. */
+  targetPort?: number | null
+  dockerfilePath?: string | null
+  /** Written back by the control plane once Railway has created the service. */
+  serviceId?: string | null
+  serviceName?: string | null
+  environmentId?: string | null
+}
+
+/** The enum lists and defaults the Railway settings form renders. */
+export type RailwayOptions = {
+  regions: string[]
+  restartPolicies: ('ON_FAILURE' | 'ALWAYS' | 'NEVER')[]
+  defaults: {
+    region: string
+    healthcheckPath: string
+    numReplicas: number
+    restartPolicyType: string
+    sleepApplication: boolean
+    environmentName: string
+  }
+  consoleUrl: string
+  apiKeyUrl: string
+}
+
+/** One Railway project a token can reach. Services are created inside one. */
+export type RailwayProject = { id: string; name: string }
+
+export type RailwayConnection = Connection & {
+  accountId?: string | null
+  accountName?: string | null
+  /** Null for a workspace token — those have no user identity, by design. */
+  user?: { id?: string | null; name?: string | null; email?: string | null } | null
+  /** Which kind of token this is, inferred from whether `me` was allowed. */
+  tokenKind?: 'account' | 'workspace' | null
+  /** Null when the token sees several projects and none is pinned yet. */
+  projectId: string | null
+  projects: RailwayProject[]
+  error?: { code?: string; message?: string }
+}
+
+export type RenderConnection = Connection & {
+  accountId?: string | null
+  accountName?: string | null
+  email?: string | null
+  /** Null when the key reaches several workspaces and none is pinned yet. */
+  ownerId: string | null
+  workspaces: RenderWorkspace[]
+  error?: { code?: string; message?: string }
+}
+
 /** service_config.links — one entry per database this service reads. */
 export type ServiceLinkMeta = {
   /** Absent on records written before url links existed — those are databases. */
@@ -66,10 +198,16 @@ export type Service = {
   startCommand: string | null
   serviceConfig: {
     canvas?: CanvasMeta
+    /** backend services only — which target below applies. */
+    deployTarget?: DeployTarget
     /** frontend services only */
     vercel?: VercelMeta
-    /** backend services only */
+    /** backend services on the container target */
     container?: ContainerMeta
+    /** backend services on the Render target */
+    render?: RenderMeta
+    /** backend services on the Railway target */
+    railway?: RailwayMeta
     /** database services only */
     engine?: string
     /** Databases this service reads, keyed by the database node's service id. */

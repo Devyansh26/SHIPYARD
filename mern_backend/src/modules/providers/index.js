@@ -15,6 +15,11 @@
 import { env } from '../../config/env.js';
 import { decryptSecret } from '../../utils/crypto.js';
 import { createContainerAdapter, containerTargetConfigured } from './container.js';
+// Render and Railway each live in their own module folder
+// (`modules/render/`, `modules/railway/`) so the integrations are
+// self-contained; only the registry below knows they exist.
+import { createRenderAdapter } from '../render/adapter.js';
+import { createRailwayAdapter } from '../railway/adapter.js';
 import {
   vercelClient, mapReadyState, publicUrl, isTerminal, envTargets, envType,
 } from './vercel.js';
@@ -281,29 +286,157 @@ function createVercelAdapter({ token, teamId }) {
   };
 }
 
-const ADAPTERS = { vercel: createVercelAdapter };
+const ADAPTERS = {
+  vercel: createVercelAdapter,
+  render: createRenderAdapter,
+  railway: createRailwayAdapter,
+};
 
 /**
- * Which target deploys which kind of service. This table is the ONLY place that
- * maps a service_type to a provider, so callers ask here instead of branching
- * on type themselves.
+ * ============================================================================
+ * THE DEPLOY TARGET REGISTRY — the one place to edit when adding a provider.
+ * ============================================================================
  *
  * `requiresConnection` distinguishes a provider the user authorises with their
- * own credential (Vercel) from our own infrastructure (containers), which has
- * no per-user credential at all.
+ * own credential (Vercel, Render, Railway) from our own infrastructure
+ * (containers via CMS), which has no per-user credential at all.
+ *
+ * `configKey` names the `service_config` block holding that target's settings,
+ * so nothing else has to know that Render's live under `render` and the
+ * container host's under `container`.
+ *
+ * `label` and `description` are served to the browser by
+ * `GET /api/v1/deploy-targets` and rendered verbatim in the "Add service"
+ * picker and the Settings tab. Neither is duplicated in the frontend, so a
+ * target added here appears in the UI with no frontend change at all.
+ *
+ * ---------------------------------------------------------------------------
+ * To add a target (Fly, Heroku…), in this order:
+ *
+ *   1. `modules/<name>/` — client.js, config.js, status.js, adapter.js, and
+ *      routes.js if it needs its own connection endpoints. Copy
+ *      `modules/render/` (REST) or `modules/railway/` (GraphQL); both are
+ *      worked examples of a connection-gated target and each has a README.
+ *   2. Add one entry to PROVIDER_TARGETS below.
+ *   3. Add its key to the relevant `SERVICE_TARGETS[type].allowed` array.
+ *   4. Register its adapter factory in ADAPTERS above (connection-gated
+ *      targets only) and mount its routes in `app.js`.
+ *   5. Widen the `provider_connections.provider_type` CHECK constraint — see
+ *      `modules/render/migration.sql` for the pattern.
+ *
+ * That is the whole list. No route, no deployment-service branch and no
+ * frontend component needs to change: the adapter interface and this registry
+ * are what everything else reads.
+ * ---------------------------------------------------------------------------
+ */
+const PROVIDER_TARGETS = {
+  vercel: {
+    provider: 'vercel',
+    requiresConnection: true,
+    label: 'Vercel',
+    configKey: 'vercel',
+    description: 'Deploys to your own Vercel account. You stay the owner of every project.',
+  },
+  render: {
+    provider: 'render',
+    requiresConnection: true,
+    label: 'Render',
+    configKey: 'render',
+    description: 'Runs as a web service in your own Render account. Needs a Render API key.',
+  },
+  railway: {
+    provider: 'railway',
+    requiresConnection: true,
+    label: 'Railway',
+    configKey: 'railway',
+    description: 'Runs as a service in your own Railway project. Needs a Railway API token.',
+  },
+  container: {
+    provider: 'container',
+    requiresConnection: false,
+    label: 'Self-hosted container',
+    configKey: 'container',
+    description: 'Runs as a Docker container on the host this ShipYard server manages. '
+      + 'No third-party account.',
+  },
+};
+
+/**
+ * Which targets each kind of service may deploy to. This table is the ONLY
+ * place that maps a service_type to a provider, so callers ask here instead of
+ * branching on type themselves.
+ *
+ * `allowed` is the menu. Its ORDER is the order the picker shows, so put the
+ * least surprising option first.
+ *
+ * `default` is the fallback for a service whose `service_config.deployTarget`
+ * is missing — which now only happens for services created before the choice
+ * existed. It is `container` for backends so those keep deploying exactly
+ * where they always did, and it is deliberately NOT a preference for new
+ * services: the canvas asks which target to use when the node is created and
+ * writes the answer explicitly, so nothing new relies on this value.
  */
 const SERVICE_TARGETS = {
-  frontend: { provider: 'vercel', requiresConnection: true },
-  backend: { provider: 'container', requiresConnection: false },
+  frontend: { default: 'vercel', allowed: ['vercel'] },
+  backend: { default: 'container', allowed: ['container', 'render', 'railway'] },
   database: null,
 };
 
+/** Resolves a (type, explicit choice) pair to one concrete target. */
+export function resolveDeployTarget(serviceType, deployTarget) {
+  const spec = SERVICE_TARGETS[serviceType];
+  if (!spec) return null;
+  const chosen = typeof deployTarget === 'string' && spec.allowed.includes(deployTarget)
+    ? deployTarget
+    : spec.default;
+  return { ...PROVIDER_TARGETS[chosen], serviceType, deployTarget: chosen };
+}
+
+/** The explicit choice stored on a service row, if any. */
+export function deployTargetOf(service) {
+  const raw = (service?.service_config ?? {}).deployTarget;
+  return typeof raw === 'string' ? raw : null;
+}
+
+/**
+ * The target for one specific service — the resolution every deploy path must
+ * use, because two backend services in the same project can legitimately point
+ * at different providers.
+ */
+export function targetForService(service) {
+  return resolveDeployTarget(service?.service_type, deployTargetOf(service));
+}
+
+/** The type-level default. Use `targetForService` when a row is available. */
 export function targetForServiceType(serviceType) {
-  return SERVICE_TARGETS[serviceType] ?? null;
+  return resolveDeployTarget(serviceType, null);
+}
+
+/**
+ * Which targets the UI may offer for a service type, in menu order.
+ *
+ * `isDefault` is reported so the Settings tab can mark what a legacy service
+ * with no stored choice resolves to. It is NOT a hint for the picker to
+ * pre-select — the choice is the user's to make when the node is created.
+ */
+export function allowedTargetsForServiceType(serviceType) {
+  const spec = SERVICE_TARGETS[serviceType];
+  if (!spec) return [];
+  return spec.allowed.map((key) => ({
+    ...PROVIDER_TARGETS[key],
+    deployTarget: key,
+    isDefault: key === spec.default,
+  }));
+}
+
+/** True when `deployTarget` is a target this service type actually allows. */
+export function isAllowedTarget(serviceType, deployTarget) {
+  const spec = SERVICE_TARGETS[serviceType];
+  return Boolean(spec && typeof deployTarget === 'string' && spec.allowed.includes(deployTarget));
 }
 
 export function isDeployable(serviceType) {
-  return targetForServiceType(serviceType) !== null;
+  return SERVICE_TARGETS[serviceType] != null;
 }
 
 export const DEPLOYABLE_SERVICE_TYPES = Object.entries(SERVICE_TARGETS)
@@ -333,7 +466,15 @@ export function createAdapter({ providerType, credentialsRef, externalAccountId 
   const teamId = typeof externalAccountId === 'string' && externalAccountId.startsWith('team_')
     ? externalAccountId
     : null;
-  return factory({ token: decryptSecret(credentialsRef), teamId });
+  // The same column means something different per provider: Vercel's team id,
+  // Render's "owner" (`usr-…` / `tea-…`), Railway's project id. All three
+  // spellings are handed over and each factory takes the one it understands.
+  return factory({
+    token: decryptSecret(credentialsRef),
+    teamId,
+    ownerId: externalAccountId ?? null,
+    projectId: externalAccountId ?? null,
+  });
 }
 
 export const SUPPORTED_PROVIDERS = Object.keys(ADAPTERS);
@@ -345,19 +486,28 @@ export const SUPPORTED_PROVIDERS = Object.keys(ADAPTERS);
  */
 export function SERVICE_TARGET_SUMMARY() {
   const lines = [];
-  for (const [type, target] of Object.entries(SERVICE_TARGETS)) {
-    if (!target) {
+  for (const [type, spec] of Object.entries(SERVICE_TARGETS)) {
+    if (!spec) {
       lines.push(`deploy target  ${type.padEnd(9)} -> none (not deployable)`);
       continue;
     }
-    if (target.provider === 'container') {
-      lines.push(
-        containerTargetConfigured()
-          ? `deploy target  ${type.padEnd(9)} -> container via CMS at ${env.CMS_BASE_URL}`
-          : `deploy target  ${type.padEnd(9)} -> container (NOT CONFIGURED: set CMS_BASE_URL + CMS_INTERNAL_KEY)`
-      );
-    } else {
-      lines.push(`deploy target  ${type.padEnd(9)} -> ${target.provider} (per-user connection)`);
+    for (const key of spec.allowed) {
+      const target = PROVIDER_TARGETS[key];
+      // A backend can go to either place, so the table has to say which one a
+      // service with no explicit choice gets — that is the line people check
+      // when a deploy went somewhere unexpected.
+      const marker = key === spec.default ? ' [default]' : '';
+      if (target.provider === 'container') {
+        lines.push(
+          containerTargetConfigured()
+            ? `deploy target  ${type.padEnd(9)} -> container via CMS at ${env.CMS_BASE_URL}${marker}`
+            : `deploy target  ${type.padEnd(9)} -> container (NOT CONFIGURED: set CMS_BASE_URL + CMS_INTERNAL_KEY)${marker}`
+        );
+      } else {
+        lines.push(
+          `deploy target  ${type.padEnd(9)} -> ${target.provider} (per-user connection)${marker}`
+        );
+      }
     }
   }
   return lines;
