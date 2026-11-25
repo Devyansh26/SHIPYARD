@@ -41,6 +41,14 @@ export const api = {
       body: JSON.stringify(teamId ? { token, teamId } : { token }),
     }),
   disconnectVercel: () => req('/api/v1/connections/vercel', { method: 'DELETE' }),
+  azureConnection: () => req('/api/v1/connections/azure'),
+  azureSubscriptions: () => req('/api/v1/connections/azure/subscriptions'),
+  selectAzureSubscription: (subscriptionId: string) =>
+    req('/api/v1/connections/azure/subscription', {
+      method: 'PATCH',
+      body: JSON.stringify({ subscriptionId }),
+    }),
+  disconnectAzure: () => req('/api/v1/connections/azure', { method: 'DELETE' }),
 
   // --- deployments ----------------------------------------------------------
   deployments: (pid: string, sid: string) => req(`/api/v1/projects/${pid}/services/${sid}/deployments`),
@@ -113,4 +121,5 @@ export const OAUTH = {
   // sign-in does not silently reuse the previously authorized account.
   githubSwitch: '/api/v1/auth/github?switch=1',
   vercel: '/api/v1/connections/vercel/authorize',
+  azure: '/api/v1/connections/azure/authorize',
 };

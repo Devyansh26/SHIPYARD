@@ -2,11 +2,12 @@ import { useEffect, useMemo, useState, type ReactNode } from 'react'
 import { api } from '../api'
 import {
   errCode, errMessage,
-  type ContainerMeta, type PortMapping, type Service, type VercelMeta,
+  type AzureMeta, type ContainerMeta, type PortMapping, type Service, type VercelMeta,
 } from '../lib/types'
 import { Button, Field, Spinner } from '../components/ui'
 import { PlusIcon, TrashIcon } from '../components/icons'
 import { TYPE_META, inputCls } from '../lib/meta'
+import AzureServiceSettings from '../integrations/AzureServiceSettings'
 
 /**
  * Settings differ per service type because the deployment targets differ:
@@ -128,10 +129,28 @@ export function buildServiceConfig(
   service: Service,
   form: FormState,
   ports: PortRow[],
+  provider?: 'vercel' | 'container' | 'azure',
+  azure?: AzureMeta,
 ): Record<string, unknown> {
   const config: Record<string, unknown> = { ...(service.serviceConfig ?? {}) }
   const vercel: VercelMeta = service.serviceConfig?.vercel ?? {}
   const container: ContainerMeta = service.serviceConfig?.container ?? {}
+
+  if (service.serviceType === 'database') {
+    config.engine = form.engine
+    return config
+  }
+
+  const resolvedProvider = provider ?? (service.serviceType === 'frontend' ? 'vercel' : 'container')
+  config.provider = resolvedProvider
+
+  if (resolvedProvider === 'azure') {
+    config.azure = {
+      ...(service.serviceConfig?.azure ?? {}),
+      ...(azure ?? {}),
+    }
+    return config
+  }
 
   if (service.serviceType === 'frontend') {
     config.vercel = {
@@ -143,22 +162,17 @@ export function buildServiceConfig(
     return config
   }
 
-  if (service.serviceType === 'backend') {
-    const resources = form.cpuLimit || form.memoryLimit
-      ? { cpuLimit: form.cpuLimit || null, memoryLimit: form.memoryLimit || null }
-      : null
-    const healthPort = Number.parseInt(form.healthPort, 10)
-    const healthCheck = form.healthPath.trim() || form.healthPort.trim()
-      ? {
-        path: form.healthPath.trim() || '/health',
-        port: Number.isFinite(healthPort) ? healthPort : null,
-      }
-      : null
-    config.container = { ...container, ports: fromPortRows(ports), resources, healthCheck }
-    return config
-  }
-
-  config.engine = form.engine
+  const resources = form.cpuLimit || form.memoryLimit
+    ? { cpuLimit: form.cpuLimit || null, memoryLimit: form.memoryLimit || null }
+    : null
+  const healthPort = Number.parseInt(form.healthPort, 10)
+  const healthCheck = form.healthPath.trim() || form.healthPort.trim()
+    ? {
+      path: form.healthPath.trim() || '/health',
+      port: Number.isFinite(healthPort) ? healthPort : null,
+    }
+    : null
+  config.container = { ...container, ports: fromPortRows(ports), resources, healthCheck }
   return config
 }
 
@@ -173,6 +187,16 @@ export default function SettingsTab({
   const vercel: VercelMeta = service.serviceConfig?.vercel ?? {}
   const container: ContainerMeta = service.serviceConfig?.container ?? {}
   const kind = service.serviceType
+  const defaultProvider = kind === 'frontend' ? 'vercel' : 'container'
+  const [provider, setProvider] = useState<'vercel' | 'container' | 'azure'>(
+    service.serviceConfig?.provider ?? defaultProvider,
+  )
+  const [azure, setAzure] = useState<AzureMeta>(
+    service.serviceConfig?.azure ?? {
+      serviceKind: kind === 'frontend' ? 'static_web_apps' : 'app_service',
+      location: 'eastus',
+    },
+  )
 
   const [form, setForm] = useState<FormState>({
     name: service.name,
@@ -228,7 +252,7 @@ export default function SettingsTab({
     setError(null)
     setSaving(true)
     try {
-      const serviceConfig = buildServiceConfig(service, form, ports)
+      const serviceConfig = buildServiceConfig(service, form, ports, provider, azure)
 
       const r = await api.updateService(projectId, service.id, {
         name: form.name.trim(),
@@ -315,6 +339,41 @@ export default function SettingsTab({
         </Section>
       ) : (
         <>
+          <Section title="Deployment provider">
+            <Field label="Cloud provider">
+              <select
+                className={inputCls}
+                value={provider}
+                onChange={(e) => {
+                  setProvider(e.target.value as 'vercel' | 'container' | 'azure')
+                  setSaved(false)
+                }}
+              >
+                {kind === 'frontend' ? (
+                  <>
+                    <option value="vercel">Vercel</option>
+                    <option value="azure">Microsoft Azure</option>
+                  </>
+                ) : (
+                  <>
+                    <option value="container">Self-hosted Container (CMS)</option>
+                    <option value="azure">Microsoft Azure</option>
+                  </>
+                )}
+              </select>
+            </Field>
+            {provider === 'azure' && (
+              <AzureServiceSettings
+                serviceType={kind}
+                value={azure}
+                onChange={(next) => {
+                  setAzure(next)
+                  setSaved(false)
+                }}
+              />
+            )}
+          </Section>
+
           <Section title="Source">
             <Field label="Repository" hint="owner/repo, or a full GitHub URL.">
               <input className={inputCls} value={form.repository} onChange={(e) => set('repository')(e.target.value)} />

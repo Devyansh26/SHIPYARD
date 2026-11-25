@@ -12,10 +12,11 @@ import { loadGithubToken } from '../auth/tokens.js';
 import { github } from '../auth/github.js';
 import {
   createAdapter, createKeylessAdapter, targetForServiceType, DEPLOYABLE_SERVICE_TYPES,
-} from '../providers/index.js';
+} from '../../integrations/index.js';
+import { isTerminalStatus as isTerminal } from '../../integrations/core/interfaces/providerAdapter.js';
+import { parseRepository, slugifyResourceName } from '../../integrations/core/shared/repository.js';
 import { buildDeploymentJob, containerConfig } from '../providers/container.js';
-import { parseRepository, slugifyProjectName, isTerminal } from '../providers/vercel.js';
-import { requireConnection, linkServiceConnection } from '../connections/repository.js';
+import { requireConnection, linkServiceConnection, updateConnectionCredentials } from '../connections/repository.js';
 import { loadEnvForDeploy } from '../envvars/repository.js';
 import { refreshUrlLinks } from '../links/service.js';
 import { query } from '../../db/pool.js';
@@ -33,8 +34,8 @@ import {
  * between a provider the user authorises with their own credential (Vercel) and
  * our own infrastructure (containers via CMS), which has no per-user credential.
  */
-async function resolveTarget(userId, serviceType) {
-  const target = targetForServiceType(serviceType);
+async function resolveTarget(userId, serviceType, serviceConfig = null) {
+  const target = targetForServiceType(serviceType, serviceConfig);
   if (!target) {
     const e = new Error(
       `service_type "${serviceType}" cannot be deployed. `
@@ -47,14 +48,17 @@ async function resolveTarget(userId, serviceType) {
   }
   // 409 <PROVIDER>_NOT_CONNECTED — the signal the UI turns into "Connect …".
   const connection = await requireConnection(userId, target.provider);
-  return { ...target, adapter: adapterFor(connection), connection };
+  return { ...target, adapter: adapterFor(userId, connection), connection };
 }
 
-function adapterFor(connectionRow) {
+function adapterFor(userId, connectionRow) {
   return createAdapter({
     providerType: connectionRow.provider_type,
     credentialsRef: connectionRow.credentials_ref,
     externalAccountId: connectionRow.external_account_id,
+    connectionId: connectionRow.connection_id,
+    onCredentialsUpdated: ({ credentialsRef, externalAccountId }) =>
+      updateConnectionCredentials(userId, connectionRow.connection_id, { externalAccountId, credentialsRef }),
   });
 }
 
@@ -80,7 +84,7 @@ function buildSnapshot(service, parsed, vercelCfg) {
 
 export async function triggerDeployment(userId, projectId, serviceId, opts = {}) {
   const service = await getOwnedService(userId, projectId, serviceId);
-  const target = await resolveTarget(userId, service.service_type);
+  const target = await resolveTarget(userId, service.service_type, service.service_config);
 
   await assertNoActiveDeployment(serviceId);
 
@@ -97,8 +101,9 @@ export async function triggerDeployment(userId, projectId, serviceId, opts = {})
   }
 
   const vercelCfg = (service.service_config ?? {}).vercel ?? {};
+  const azureCfg = (service.service_config ?? {}).azure ?? {};
   const projectName = vercelCfg.projectName
-    || slugifyProjectName(service.project_name, service.service_name);
+    || slugifyResourceName([service.project_name, service.service_name], { maxLength: 100 });
   const deployTarget = opts.target ?? vercelCfg.target ?? 'production';
 
   const snapshot = buildSnapshot(service, parsed, vercelCfg);
@@ -117,13 +122,18 @@ export async function triggerDeployment(userId, projectId, serviceId, opts = {})
 
     const project = await target.adapter.ensureProject({
       serviceId: service.service_id,
+      serviceType: service.service_type,
+      projectName: service.project_name,
       name: projectName,
       repoFullName: parsed.fullName,
+      ref: branch,
       framework: vercelCfg.framework ?? null,
       rootDirectory: service.root_directory,
       buildCommand: service.build_command,
+      startCommand: service.start_command,
       installCommand: vercelCfg.installCommand ?? null,
       outputDirectory: vercelCfg.outputDirectory ?? null,
+      azure: azureCfg,
     });
 
     if (target.connection) {
@@ -148,20 +158,30 @@ export async function triggerDeployment(userId, projectId, serviceId, opts = {})
       });
     }
 
-    // --- Vercel ------------------------------------------------------------
-    // Push env vars BEFORE starting the build: Vercel snapshots project env at
-    // build time, so syncing afterwards would not reach this deployment. A
-    // failure here fails the deploy on purpose — shipping without the
-    // variables the user configured produces a silently broken app.
-    const envResult = await target.adapter.syncEnv({ projectId: project.id, vars: envVars });
+    // --- External cloud provider (Vercel, Azure, etc.) ---------------------
+    // Push env vars BEFORE starting the build so build & runtime see them.
+    const envContext = {
+      serviceType: service.service_type,
+      projectName: service.project_name,
+      azure: azureCfg,
+      ...(project.settings ?? {}),
+    };
+    const envResult = await target.adapter.syncEnv({ projectId: project.id, vars: envVars, context: envContext });
 
     const started = await target.adapter.deploy({
       projectId: project.id,
       projectName: project.name,
+      serviceType: service.service_type,
       repoId: repoMeta.id,
       repoFullName: parsed.fullName,
       ref: branch,
+      rootDirectory: service.root_directory,
+      buildCommand: service.build_command,
+      startCommand: service.start_command,
       target: deployTarget,
+      azure: azureCfg,
+      envVars,
+      ghToken,
     });
 
     const updated = await patchDeployment(row.deployment_id, {
@@ -173,13 +193,10 @@ export async function triggerDeployment(userId, projectId, serviceId, opts = {})
           projectId: project.id,
           projectName: project.name,
           projectCreated: project.createdNow,
-          // Which project settings this deploy pushed to Vercel, and anything
-          // it refused to push. Vercel freezes a project's settings into each
-          // deployment, so "what did this build actually run with" is only
-          // answerable if we record the push that preceded it.
           projectSettings: project.settings ?? null,
           deploymentId: started.providerDeploymentId,
           inspectorUrl: started.inspectorUrl,
+          ...(started.meta ? { azureMeta: started.meta } : {}),
         },
         // Keys only — never values. This is an audit trail of what the build
         // was given, and config_snapshot is returned to the browser.
@@ -281,15 +298,16 @@ export async function syncDeployment(userId, row) {
   // asking Vercel about a container id would 404 and wrongly mark it failed.
   if (providerRef.type === 'container') return row;
 
+  const providerType = providerRef.type || 'vercel';
   let connection;
   try {
-    connection = await requireConnection(userId, 'vercel');
+    connection = await requireConnection(userId, providerType);
   } catch {
     return row; // disconnected mid-flight; leave the row untouched
   }
 
   try {
-    const state = await adapterFor(connection).status(providerRef.deploymentId);
+    const state = await adapterFor(userId, connection).status(providerRef.deploymentId, providerRef);
     if (state.status === row.status && !state.url && !state.errorMessage) return row;
     return await patchDeployment(row.deployment_id, {
       status: state.status,
@@ -301,12 +319,12 @@ export async function syncDeployment(userId, row) {
       finished: state.finished,
     });
   } catch (e) {
-    // A deployment Vercel no longer knows about is dead; anything else is
+    // A deployment the provider no longer knows about is dead; anything else is
     // transient and must not corrupt a running deployment.
     if (e.status === 404) {
       return patchDeployment(row.deployment_id, {
         status: 'failed',
-        snapshotPatch: { errorMessage: 'Deployment no longer exists on Vercel' },
+        snapshotPatch: { errorMessage: `Deployment no longer exists on ${providerType}` },
         finished: true,
       });
     }
@@ -388,8 +406,9 @@ export async function getDeploymentLogs(userId, deploymentId) {
       note: 'Build logs for container deployments are not collected yet — the worker holds them.',
     };
   }
-  const connection = await requireConnection(userId, 'vercel');
-  return { logs: await adapterFor(connection).logs(providerRef.deploymentId) };
+  const providerType = providerRef.type || 'vercel';
+  const connection = await requireConnection(userId, providerType);
+  return { logs: await adapterFor(userId, connection).logs(providerRef.deploymentId, { context: providerRef }) };
 }
 
 export async function cancelDeployment(userId, deploymentId) {
@@ -426,9 +445,10 @@ export async function cancelDeployment(userId, deploymentId) {
     }));
   }
 
-  const connection = await requireConnection(userId, 'vercel');
+  const providerType = providerRef.type || 'vercel';
+  const connection = await requireConnection(userId, providerType);
   if (providerRef.deploymentId) {
-    await adapterFor(connection).destroy(providerRef.deploymentId);
+    await adapterFor(userId, connection).destroy(providerRef.deploymentId, providerRef);
   }
   return serializeDeployment(await patchDeployment(row.deployment_id, {
     status: 'cancelled',
@@ -523,9 +543,17 @@ export async function removeProviderEnv(userId, serviceId, key) {
      ORDER BY created_at DESC LIMIT 1`,
     [serviceId]
   );
-  const projectId = rows[0]?.config_snapshot?.provider?.projectId;
+  const providerRef = rows[0]?.config_snapshot?.provider;
+  const projectId = providerRef?.projectId;
   if (!projectId) return { skipped: 'never-deployed' };
 
-  const connection = await requireConnection(userId, 'vercel');
-  return adapterFor(connection).removeEnv({ projectId, key });
+  const providerType = providerRef?.type || 'vercel';
+  if (providerType === 'container') return { skipped: 'inline-env' };
+
+  const connection = await requireConnection(userId, providerType);
+  return adapterFor(userId, connection).removeEnv({
+    projectId,
+    key,
+    context: providerRef.azureMeta ?? providerRef.projectSettings ?? {},
+  });
 }

@@ -1,0 +1,17 @@
+{
+  "deploymentId": "dep_e2e_cf_002",
+  "serviceId": "svc_e2e_cf",
+  "projectId": "prj_e2e_cf",
+  "commitSha": "HEAD",
+  "branch": "master",
+  "configSnapshot": {
+    "service_id": "svc_e2e_cf",
+    "project_id": "prj_e2e_cf",
+    "service_name": "e2e-cf",
+    "service_type": "backend",
+    "repository": "https://github.com/octocat/Hello-World.git",
+    "branch": "master",
+    "start_command": "node -e \"require('http').createServer((q,s)=>s.end('shipyard-e2e-works')).listen(3000)\"",
+    "ports": [{"containerPort": 3000, "protocol": "tcp"}]
+  }
+}

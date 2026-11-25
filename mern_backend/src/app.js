@@ -36,6 +36,7 @@ export function createApp() {
   // Provider connections (Vercel OAuth / access token). Mounted before the
   // project tree because connecting is a prerequisite for deploying.
   app.use('/api/v1/connections', connectionRoutes);
+  app.use('/api/v1/integrations', connectionRoutes);
   app.use('/api/v1/projects', projectRoutes);
   // Nested services: /api/v1/projects/:projectId/services
   app.use('/api/v1/projects/:projectId/services', serviceRoutes);
