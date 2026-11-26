@@ -50,6 +50,80 @@ export const api = {
     }),
   disconnectAzure: () => req('/api/v1/connections/azure', { method: 'DELETE' }),
 
+  // --- deploy targets -------------------------------------------------------
+  // The target menu, served from the registry in providers/index.js. Fetched
+  // rather than hardcoded so a provider added on the server shows up in the
+  // picker with no frontend change. Omit `serviceType` to get every deployable
+  // type at once — what the "Add service" menu wants.
+  deployTargets: (serviceType?: string) =>
+    req(`/api/v1/deploy-targets${serviceType ? `?serviceType=${encodeURIComponent(serviceType)}` : ''}`),
+
+  // --- Cloudflare Pages (frontend target) -----------------------------------
+  // Same connection gate as the others: 409 CLOUDFLARE_NOT_CONNECTED until a
+  // token is stored. The pinned value is a Cloudflare ACCOUNT id — Pages
+  // projects are created inside one.
+  cloudflareConnection: () => req('/api/v1/connections/cloudflare'),
+  cloudflareOptions: () => req('/api/v1/connections/cloudflare/options'),
+  connectCloudflareToken: (token: string, accountId?: string) =>
+    req('/api/v1/connections/cloudflare/token', {
+      method: 'POST',
+      body: JSON.stringify(accountId ? { token, accountId } : { token }),
+    }),
+  setCloudflareAccount: (accountId: string) =>
+    req('/api/v1/connections/cloudflare/account', {
+      method: 'PATCH',
+      body: JSON.stringify({ accountId }),
+    }),
+  disconnectCloudflare: () => req('/api/v1/connections/cloudflare', { method: 'DELETE' }),
+
+  // --- Render (backend target) ----------------------------------------------
+  // The same connection gate as Vercel: until a key is stored, a backend
+  // deploy to Render answers 409 RENDER_NOT_CONNECTED. Render has no
+  // third-party OAuth app programme, so the user pastes an API key from their
+  // own dashboard — verified against GET /v1/owners before it is stored,
+  // encrypted server-side and never returned here.
+  //
+  // 404 RENDER_NOT_CONNECTED is the normal empty state, not an error.
+  renderConnection: () => req('/api/v1/connections/render'),
+  // The runtime / region / plan lists. Credential-free: the Settings form needs
+  // them before any Render account is connected.
+  renderOptions: () => req('/api/v1/connections/render/options'),
+  connectRenderKey: (apiKey: string, ownerId?: string) =>
+    req('/api/v1/connections/render/key', {
+      method: 'POST',
+      body: JSON.stringify(ownerId ? { apiKey, ownerId } : { apiKey }),
+    }),
+  // Switch workspace without re-pasting the key. Services already deployed to
+  // the previous workspace keep running there.
+  setRenderWorkspace: (ownerId: string) =>
+    req('/api/v1/connections/render/workspace', {
+      method: 'PATCH',
+      body: JSON.stringify({ ownerId }),
+    }),
+  disconnectRender: () => req('/api/v1/connections/render', { method: 'DELETE' }),
+
+  // --- Railway (backend target) ---------------------------------------------
+  // Same connection gate as Render: 409 RAILWAY_NOT_CONNECTED until a token is
+  // stored. Railway's API is GraphQL, but that is entirely server-side — this
+  // client only ever talks to the Control API.
+  //
+  // The pinned value here is a Railway PROJECT, not a workspace: Railway nests
+  // services inside a project, so one must be chosen before anything can be
+  // created. 404 RAILWAY_NOT_CONNECTED is the normal empty state.
+  railwayConnection: () => req('/api/v1/connections/railway'),
+  railwayOptions: () => req('/api/v1/connections/railway/options'),
+  connectRailwayToken: (token: string, projectId?: string) =>
+    req('/api/v1/connections/railway/token', {
+      method: 'POST',
+      body: JSON.stringify(projectId ? { token, projectId } : { token }),
+    }),
+  setRailwayProject: (projectId: string) =>
+    req('/api/v1/connections/railway/project', {
+      method: 'PATCH',
+      body: JSON.stringify({ projectId }),
+    }),
+  disconnectRailway: () => req('/api/v1/connections/railway', { method: 'DELETE' }),
+
   // --- deployments ----------------------------------------------------------
   deployments: (pid: string, sid: string) => req(`/api/v1/projects/${pid}/services/${sid}/deployments`),
   // Branch HEAD + whether it is already deployed. Separate from the list on

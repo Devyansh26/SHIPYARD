@@ -39,17 +39,33 @@ const DEFAULT_PROVIDER_BY_SERVICE_TYPE = {
 };
 
 /**
+ * The per-service provider choice, read from `service_config`.
+ *
+ * Two keys are accepted. `provider` is canonical. `deployTarget` is what the
+ * backend target picker wrote before the two branches merged, so it is still
+ * read — a service created by that picker must keep deploying where it was
+ * told to, and silently falling back to the default would move it.
+ *
+ * New writes should use `provider`; this exists so old rows do not break.
+ */
+export function providerChoiceOf(serviceConfig) {
+  for (const key of ['provider', 'deployTarget']) {
+    const raw = serviceConfig?.[key];
+    if (typeof raw === 'string' && raw.trim() !== '') return raw.trim();
+  }
+  return null;
+}
+
+/**
  * Resolves the target provider descriptor for a service_type + optional service_config.
- * Checks `serviceConfig.provider` first, falling back to the default for `serviceType`.
+ * Checks the per-service choice first, falling back to the default for `serviceType`.
  */
 export function targetForServiceType(serviceType, serviceConfig = null) {
   const defaultProvider = DEFAULT_PROVIDER_BY_SERVICE_TYPE[serviceType] ?? null;
   if (!defaultProvider) return null;
 
-  const requested = serviceConfig?.provider;
-  const providerType = typeof requested === 'string' && requested.trim() !== ''
-    ? requested.trim()
-    : defaultProvider;
+  const requested = providerChoiceOf(serviceConfig);
+  const providerType = requested ?? defaultProvider;
 
   const def = PROVIDERS.get(providerType);
   if (!def) {
@@ -63,10 +79,54 @@ export function targetForServiceType(serviceType, serviceConfig = null) {
     );
   }
 
+  // Deliberately just these two fields. The deploy path needs nothing more,
+  // and `integrations/__tests__` asserts the shape with deepStrictEqual — the
+  // UI metadata (label, description, isDefault) lives on
+  // `allowedTargetsForServiceType` instead, which is what the picker reads.
   return {
     provider: def.providerType,
     requiresConnection: Boolean(def.requiresConnection),
   };
+}
+
+/** The target for one service ROW. Prefer this wherever a row is in hand. */
+export function targetForService(service) {
+  return targetForServiceType(service?.service_type, service?.service_config ?? null);
+}
+
+/**
+ * Every provider a service type may deploy to, in registration order.
+ *
+ * Non-throwing, unlike `targetForServiceType` — this one answers "what could
+ * the user pick", so an unregistered choice is simply absent rather than an
+ * error. Backs `GET /api/v1/deploy-targets` and the Settings dropdown, which
+ * is why `label`/`description` live on the registration and not in the
+ * frontend: a provider registered here shows up in the UI with no frontend
+ * change.
+ */
+export function allowedTargetsForServiceType(serviceType) {
+  const defaultProvider = DEFAULT_PROVIDER_BY_SERVICE_TYPE[serviceType] ?? null;
+  if (!defaultProvider) return [];
+  return Array.from(PROVIDERS.values())
+    .filter((def) => def.supportedServiceTypes.includes(serviceType))
+    .map((def) => ({
+      provider: def.providerType,
+      deployTarget: def.providerType,
+      requiresConnection: Boolean(def.requiresConnection),
+      isDefault: def.providerType === defaultProvider,
+      label: def.label ?? def.providerType,
+      description: def.description ?? '',
+      // Keyless providers expose a server-level readiness check instead of a
+      // per-user credential; null means "nothing to check".
+      isConfigured: typeof def.isConfigured === 'function' ? def.isConfigured : null,
+    }));
+}
+
+/** True when `provider` is one this service type actually allows. */
+export function isAllowedTarget(serviceType, provider) {
+  if (typeof provider !== 'string' || provider.trim() === '') return false;
+  return allowedTargetsForServiceType(serviceType)
+    .some((t) => t.provider === provider.trim());
 }
 
 export function isDeployable(serviceType) {

@@ -2,7 +2,7 @@ import { useCallback, useEffect, useState, type ReactNode } from 'react'
 import { api, OAUTH } from '../api'
 import { usePoll } from '../lib/hooks'
 import {
-  errCode, errMessage,
+  errCode, errMessage, providerOf,
   type Connection, type ContainerTarget, type DatabaseAttachment, type DatabaseProvider,
   type Deployment, type LatestCommit, type Service, type ServiceLink,
 } from '../lib/types'
@@ -10,6 +10,9 @@ import { Button, Field, Spinner, StatusBadge } from '../components/ui'
 import { CloseIcon, ExternalIcon, GithubMark, TYPE_ICON, VercelMark } from '../components/icons'
 import { TYPE_META, inputCls } from '../lib/meta'
 import EnvVarsTab from './EnvVarsTab'
+import CloudflareConnect from './CloudflareConnect'
+import RailwayConnect from './RailwayConnect'
+import RenderConnect from './RenderConnect'
 import SettingsTab from './SettingsTab'
 import AzureConnect from '../integrations/AzureConnect'
 
@@ -130,11 +133,7 @@ function PanelBody({
           service.serviceType === 'database'
             // A database node connects to Neon/Atlas, not to a deploy target.
             ? <DatabaseConnectionTab projectId={projectId} service={service} onSaved={onSaved} />
-            : service.serviceConfig?.provider === 'azure'
-              ? <AzureConnectionTab projectId={projectId} service={service} onSaved={onSaved} />
-              : service.serviceType === 'backend'
-                ? <ContainerTargetTab projectId={projectId} service={service} onSaved={onSaved} />
-                : <ConnectionTab projectId={projectId} service={service} onSaved={onSaved} />
+            : <DeployConnectionTab projectId={projectId} service={service} onSaved={onSaved} />
         )}
       </div>
     </>
@@ -159,6 +158,9 @@ function DeployTab({
   const [error, setError] = useState<string | null>(null)
   const [logsFor, setLogsFor] = useState<string | null>(null)
   const [logs, setLogs] = useState<{ text: string; level: string }[]>([])
+  // Why a log view is empty — retention expired, plan restriction, a worker
+  // that holds the output. Without it an empty pane reads as a broken feature.
+  const [logsNote, setLogsNote] = useState<string | null>(null)
 
   const deployable = TYPE_META[service.serviceType].deployable
 
@@ -215,8 +217,48 @@ function DeployTab({
       if (code === 'VERCEL_NOT_CONNECTED') {
         setError('Connect your Vercel account first.')
         onNeedConnection()
+      } else if (code === 'RENDER_NOT_CONNECTED') {
+        setError('Connect your Render account first.')
+        onNeedConnection()
+      } else if (code === 'RAILWAY_NOT_CONNECTED') {
+        setError('Connect your Railway account first.')
+        onNeedConnection()
+      } else if (code === 'CLOUDFLARE_NOT_CONNECTED') {
+        setError('Connect your Cloudflare account first.')
+        onNeedConnection()
+      } else if (
+        code === 'CLOUDFLARE_ACCOUNT_REQUIRED' || code === 'CLOUDFLARE_ACCOUNT_MISMATCH'
+        || code === 'CLOUDFLARE_NO_ACCOUNTS'
+      ) {
+        setError(errMessage(e, 'Choose which Cloudflare account to deploy into.'))
+        onNeedConnection()
+      } else if (code === 'CLOUDFLARE_GIT_NOT_CONNECTED') {
+        // Not a credential problem: Cloudflare's GitHub App has to be
+        // installed once from their dashboard, and the message says how.
+        setError(errMessage(e, 'Cloudflare is not authorised on your GitHub repository yet.'))
+        onNeedConnection()
+      } else if (code === 'CLOUDFLARE_UNAUTHORIZED' || code === 'CLOUDFLARE_FORBIDDEN') {
+        setError(errMessage(e, 'Cloudflare rejected the stored API token — reconnect your account.'))
+        onNeedConnection()
+      } else if (code === 'RENDER_OWNER_REQUIRED' || code === 'RENDER_WORKSPACE_MISMATCH') {
+        // The key works but points at several workspaces — the Connection tab
+        // is where that gets resolved.
+        setError(errMessage(e, 'Choose which Render workspace to deploy into.'))
+        onNeedConnection()
+      } else if (
+        code === 'RAILWAY_PROJECT_REQUIRED' || code === 'RAILWAY_PROJECT_MISMATCH'
+        || code === 'RAILWAY_NO_PROJECTS' || code === 'RAILWAY_ENVIRONMENT_NOT_FOUND'
+      ) {
+        setError(errMessage(e, 'Choose which Railway project to deploy into.'))
+        onNeedConnection()
+      } else if (code === 'RENDER_UNAUTHORIZED') {
+        setError('Render rejected the stored API key — reconnect your account.')
+        onNeedConnection()
+      } else if (code === 'RAILWAY_UNAUTHORIZED') {
+        setError('Railway rejected the stored token — reconnect your account.')
       } else if (code === 'AZURE_NOT_CONNECTED' || code === 'AZURE_SUBSCRIPTION_REQUIRED') {
         setError('Connect your Microsoft Azure account and select a subscription first.')
+        onNeedConnection()
         onNeedConnection()
       } else if (code === 'CONTAINER_TARGET_NOT_CONFIGURED') {
         setError(errMessage(e, 'The container host is not configured on this server.'))
@@ -230,12 +272,14 @@ function DeployTab({
   }
 
   async function toggleLogs(id: string) {
-    if (logsFor === id) { setLogsFor(null); setLogs([]); return }
+    if (logsFor === id) { setLogsFor(null); setLogs([]); setLogsNote(null); return }
     setLogsFor(id)
     setLogs([])
+    setLogsNote(null)
     try {
       const r = await api.deploymentLogs(id)
       setLogs(r.logs ?? [])
+      setLogsNote(r.note ?? null)
     } catch (e) {
       setLogs([{ text: errMessage(e, 'Could not load logs'), level: 'error' }])
     }
@@ -366,13 +410,24 @@ function DeployTab({
                 </p>
               )}
               {logsFor === d.id && (
-                <pre className="mt-2 max-h-56 overflow-auto rounded-lg border border-line bg-page p-2.5 font-mono text-[10.5px] leading-relaxed text-muted">
-                  {logs.length === 0 ? 'No build output yet.' : logs.map((l, i) => (
-                    <span key={i} className={l.level === 'error' ? 'text-danger' : undefined}>
-                      {l.text}{'\n'}
-                    </span>
-                  ))}
-                </pre>
+                <>
+                  {logs.length > 0 && (
+                    <pre className="mt-2 max-h-56 overflow-auto rounded-lg border border-line bg-page p-2.5 font-mono text-[10.5px] leading-relaxed text-muted">
+                      {logs.map((l, i) => (
+                        <span key={i} className={l.level === 'error' ? 'text-danger' : undefined}>
+                          {l.text}{'\n'}
+                        </span>
+                      ))}
+                    </pre>
+                  )}
+                  {/* The note explains an empty pane, so it must render even
+                      when there is no output at all. */}
+                  {(logsNote || logs.length === 0) && (
+                    <p className="mt-2 rounded-lg border border-line bg-sunken px-2.5 py-2 text-[11px] leading-relaxed text-faint">
+                      {logsNote ?? 'No build output yet.'}
+                    </p>
+                  )}
+                </>
               )}
             </li>
           ))}
@@ -470,6 +525,64 @@ function CommitCard({
  * connect — only whether the Container Management Service is configured and
  * answering. Showing the Vercel panel here would be actively misleading.
  */
+/* ----------------------------------------------------- connection: backend */
+
+/**
+ * A backend's Connection tab, dispatched on its deploy target.
+ *
+ * One component rather than a branch at the call site so adding a provider
+ * means one entry in the table below. The shape is the same for every
+ * credential-backed target — the account gate, then the databases this service
+ * reads — because they are the same kind of thing.
+ *
+ * An unrecognised target falls through to the container host, matching the
+ * server's own fallback for a service with no stored choice.
+ */
+/**
+ * The Connection tab, dispatched on the service's PROVIDER.
+ *
+ * Keyed on provider rather than service type because the two do not line up:
+ * Azure serves both frontends and backends, Cloudflare Pages only frontends,
+ * Render and Railway only backends. One table keyed on the thing that actually
+ * decides the panel means adding a provider is one entry here, not another
+ * nested ternary.
+ *
+ * Every credentialed provider gets the same shape — the account gate, then the
+ * databases this service reads — because they are the same kind of thing.
+ */
+const PROVIDER_CONNECT: Record<string, { title: string; render: () => ReactNode }> = {
+  azure: { title: 'Microsoft Azure', render: () => <AzureConnect /> },
+  cloudflare: { title: 'Cloudflare account', render: () => <CloudflareConnect /> },
+  render: { title: 'Render account', render: () => <RenderConnect /> },
+  railway: { title: 'Railway project', render: () => <RailwayConnect /> },
+}
+
+function DeployConnectionTab({
+  projectId, service, onSaved,
+}: { projectId: string; service: Service; onSaved: (s: Service) => void }) {
+  // Falls back to the service type's default, matching the server: a frontend
+  // with no explicit choice is Vercel, a backend is the container host.
+  const provider = providerOf(service)
+    ?? (service.serviceType === 'frontend' ? 'vercel' : 'container')
+  const entry = PROVIDER_CONNECT[provider]
+
+  if (entry) {
+    return (
+      <div className="space-y-6">
+        <Section title={entry.title}>{entry.render()}</Section>
+        <LinkedDatabases projectId={projectId} service={service} onSaved={onSaved} />
+      </div>
+    )
+  }
+
+  // The two targets with panels of their own: the container host reports
+  // server-level readiness instead of an account, and Vercel's panel predates
+  // the table and carries its own GitHub guidance.
+  return provider === 'container'
+    ? <ContainerTargetTab projectId={projectId} service={service} onSaved={onSaved} />
+    : <ConnectionTab projectId={projectId} service={service} onSaved={onSaved} />
+}
+
 function ContainerTargetTab({
   projectId, service, onSaved,
 }: { projectId: string; service: Service; onSaved: (s: Service) => void }) {
@@ -546,21 +659,6 @@ function ContainerTargetTab({
           </p>
         </div>
       </Section>
-    </div>
-  )
-}
-
-/* ------------------------------------------------------- connection: Azure */
-
-function AzureConnectionTab({
-  projectId, service, onSaved,
-}: { projectId: string; service: Service; onSaved: (s: Service) => void }) {
-  return (
-    <div className="space-y-6">
-      <Section title="Microsoft Azure">
-        <AzureConnect />
-      </Section>
-      <LinkedDatabases projectId={projectId} service={service} onSaved={onSaved} />
     </div>
   )
 }

@@ -11,12 +11,23 @@
 import { loadGithubToken } from '../auth/tokens.js';
 import { github } from '../auth/github.js';
 import {
-  createAdapter, createKeylessAdapter, targetForServiceType, DEPLOYABLE_SERVICE_TYPES,
+  createAdapter, createKeylessAdapter, targetForService, isDeployable,
+  DEPLOYABLE_SERVICE_TYPES,
 } from '../../integrations/index.js';
 import { isTerminalStatus as isTerminal } from '../../integrations/core/interfaces/providerAdapter.js';
 import { parseRepository, slugifyResourceName } from '../../integrations/core/shared/repository.js';
 import { buildDeploymentJob, containerConfig } from '../providers/container.js';
-import { requireConnection, linkServiceConnection, updateConnectionCredentials } from '../connections/repository.js';
+// Render and Railway each slug a service name by their OWN provider's rules,
+// because the generated hostname is derived from it — so they keep their own
+// helpers rather than sharing `slugifyResourceName`.
+import { renderConfig, slugifyServiceName as slugifyRenderServiceName } from '../render/config.js';
+import {
+  railwayConfig, slugifyServiceName as slugifyRailwayServiceName,
+} from '../railway/config.js';
+import {
+  requireConnection, linkServiceConnection, updateConnectionCredentials,
+} from '../connections/repository.js';
+import { mergeServiceConfig } from '../services/repository.js';
 import { loadEnvForDeploy } from '../envvars/repository.js';
 import { refreshUrlLinks } from '../links/service.js';
 import { query } from '../../db/pool.js';
@@ -31,14 +42,23 @@ import {
  *
  * The service_type -> provider mapping lives in `providers/index.js`; this only
  * acts on the `requiresConnection` flag, which is the one real difference
- * between a provider the user authorises with their own credential (Vercel) and
- * our own infrastructure (containers via CMS), which has no per-user credential.
+ * between a provider the user authorises with their own credential (Vercel,
+ * Render) and our own infrastructure (containers via CMS), which has no
+ * per-user credential.
+ *
+ * Takes the service ROW, not just its type: a `backend` can go to Render or to
+ * the container host, and which one is a per-service choice held in
+ * `service_config.provider` (with `deployTarget` still read as the legacy
+ * spelling the backend target picker wrote).
  */
-async function resolveTarget(userId, serviceType, serviceConfig = null) {
-  const target = targetForServiceType(serviceType, serviceConfig);
+async function resolveTarget(userId, service) {
+  // Row-level, not type-level: a `backend` can go to the container host,
+  // Render, Railway or Azure, and only the row's own service_config knows
+  // which. `targetForService` reads that choice.
+  const target = targetForService(service);
   if (!target) {
     const e = new Error(
-      `service_type "${serviceType}" cannot be deployed. `
+      `service_type "${service?.service_type}" cannot be deployed. `
       + `Deployable types: ${DEPLOYABLE_SERVICE_TYPES.join(', ')}.`
     );
     e.status = 400; e.code = 'UNSUPPORTED_SERVICE_TYPE'; throw e;
@@ -47,6 +67,8 @@ async function resolveTarget(userId, serviceType, serviceConfig = null) {
     return { ...target, adapter: createKeylessAdapter(target.provider), connection: null };
   }
   // 409 <PROVIDER>_NOT_CONNECTED — the signal the UI turns into "Connect …".
+  // For Render this is exactly the gate the user asked for: no deploy is
+  // possible until they have connected their own Render account.
   const connection = await requireConnection(userId, target.provider);
   return { ...target, adapter: adapterFor(userId, connection), connection };
 }
@@ -60,6 +82,23 @@ function adapterFor(userId, connectionRow) {
     onCredentialsUpdated: ({ credentialsRef, externalAccountId }) =>
       updateConnectionCredentials(userId, connectionRow.connection_id, { externalAccountId, credentialsRef }),
   });
+}
+
+/**
+ * Builds the adapter for an EXISTING deployment row, from the provider recorded
+ * in its snapshot rather than from the service's current setting.
+ *
+ * That distinction matters once a service can be retargeted: a deployment made
+ * while the service pointed at Render must still be polled, logged and
+ * cancelled through Render, even after the user switches the service to the
+ * container host. Returns null for targets with nothing to talk to.
+ */
+async function adapterForDeployment(userId, providerRef) {
+  // Defaults to vercel for rows written before `provider.type` was recorded.
+  const provider = providerRef?.type || 'vercel';
+  if (provider === 'container') return null;
+  const connection = await requireConnection(userId, provider);
+  return adapterFor(userId, connection);
 }
 
 // Everything the provider needs, frozen into config_snapshot so the record of
@@ -84,7 +123,7 @@ function buildSnapshot(service, parsed, vercelCfg) {
 
 export async function triggerDeployment(userId, projectId, serviceId, opts = {}) {
   const service = await getOwnedService(userId, projectId, serviceId);
-  const target = await resolveTarget(userId, service.service_type, service.service_config);
+  const target = await resolveTarget(userId, service);
 
   await assertNoActiveDeployment(serviceId);
 
@@ -102,15 +141,58 @@ export async function triggerDeployment(userId, projectId, serviceId, opts = {})
 
   const vercelCfg = (service.service_config ?? {}).vercel ?? {};
   const azureCfg = (service.service_config ?? {}).azure ?? {};
-  const projectName = vercelCfg.projectName
-    || slugifyResourceName([service.project_name, service.service_name], { maxLength: 100 });
-  const deployTarget = opts.target ?? vercelCfg.target ?? 'production';
+  const renderCfg = renderConfig(service.service_config);
+  const railwayCfg = railwayConfig(service.service_config);
+  const isRender = target.provider === 'render';
+  const isRailway = target.provider === 'railway';
+
+  // Render and Railway name a service per service (not per Vercel project), and
+  // the name is what their generated hostname comes from — so each is slugged
+  // with that provider's rules and remembered once created.
+  let projectName;
+  if (isRender) {
+    projectName = renderCfg.serviceName
+      || slugifyRenderServiceName(service.project_name, service.service_name);
+  } else if (isRailway) {
+    projectName = railwayCfg.serviceName
+      || slugifyRailwayServiceName(service.project_name, service.service_name);
+  } else {
+    projectName = vercelCfg.projectName
+      || slugifyResourceName([service.project_name, service.service_name], { maxLength: 100 });
+  }
+  // Vercel's production-vs-preview environment, also used as Azure's slot
+  // name. NOT the same thing as `service_config.provider`, which selects the
+  // provider itself — hence the name, because the two read alike and mean
+  // nothing alike.
+  const vercelTarget = opts.target ?? vercelCfg.target ?? 'production';
 
   const snapshot = buildSnapshot(service, parsed, vercelCfg);
-  snapshot.provider = { type: target.provider, projectName, target: deployTarget };
+  snapshot.provider = { type: target.provider, projectName, target: vercelTarget };
+  if (isRender) {
+    // What this build was actually configured with, frozen alongside it: the
+    // plan and region decide what it costs and where it runs, and neither is
+    // recoverable from the service row after a later edit.
+    snapshot.render = {
+      runtime: renderCfg.runtime,
+      region: renderCfg.region,
+      plan: renderCfg.plan,
+      healthCheckPath: renderCfg.healthCheckPath,
+      autoDeployTrigger: renderCfg.autoDeployTrigger,
+    };
+  }
+  if (isRailway) {
+    snapshot.railway = {
+      region: railwayCfg.region || 'railway-default',
+      environmentName: railwayCfg.environmentName,
+      healthcheckPath: railwayCfg.healthcheckPath,
+      numReplicas: railwayCfg.numReplicas,
+      restartPolicyType: railwayCfg.restartPolicyType,
+      sleepApplication: railwayCfg.sleepApplication,
+    };
+  }
 
   // A container job sits on a queue until a worker claims it, so it starts as
-  // `queued`; Vercel starts building the moment we call it.
+  // `queued`; Vercel and Render start building the moment we call them.
   const initialStatus = target.provider === 'container' ? 'queued' : 'validating';
 
   // The row exists before any provider call, so a failure stays visible as a
@@ -119,6 +201,21 @@ export async function triggerDeployment(userId, projectId, serviceId, opts = {})
 
   try {
     await patchDeployment(row.deployment_id, { status: initialStatus });
+
+    // Re-resolve any linked service URL before reading the environment.
+    //
+    // This is the moment that matters: `VITE_*` and `NEXT_PUBLIC_*` are inlined
+    // at build time, so whatever is in `environment_vars` right now is what the
+    // artifact will carry for its whole life. A provider deployed for the first
+    // time since the link was drawn — or moved to a new domain — is picked up
+    // here instead of silently shipping a dead address.
+    //
+    // Resolved BEFORE ensureProject because Render needs the variables at
+    // service-creation time: `POST /v1/services` starts the first build itself,
+    // so anything pushed afterwards would miss that build entirely.
+    const linkRefresh = await refreshUrlLinks(userId, projectId, serviceId);
+
+    const envVars = await loadEnvForDeploy(serviceId);
 
     const project = await target.adapter.ensureProject({
       serviceId: service.service_id,
@@ -133,7 +230,15 @@ export async function triggerDeployment(userId, projectId, serviceId, opts = {})
       startCommand: service.start_command,
       installCommand: vercelCfg.installCommand ?? null,
       outputDirectory: vercelCfg.outputDirectory ?? null,
+      // --- Azure only.
       azure: azureCfg,
+      // --- Render / Railway only. Ignored by the Vercel, Azure and container
+      // adapters, which destructure only the fields they name.
+      parsedRepo: parsed,
+      ref: branch,
+      preDeployCommand: service.pre_deploy_command,
+      serviceConfig: service.service_config,
+      envVars,
     });
 
     if (target.connection) {
@@ -141,32 +246,55 @@ export async function triggerDeployment(userId, projectId, serviceId, opts = {})
       await linkServiceConnection(serviceId, target.connection.connection_id);
     }
 
-    // Re-resolve any linked service URL before reading the environment.
-    //
-    // This is the moment that matters: `VITE_*` and `NEXT_PUBLIC_*` are inlined
-    // at build time, so whatever is in `environment_vars` right now is what the
-    // artifact will carry for its whole life. A provider deployed for the first
-    // time since the link was drawn — or moved to a new domain — is picked up
-    // here instead of silently shipping a dead address.
-    const linkRefresh = await refreshUrlLinks(userId, projectId, serviceId);
-
-    const envVars = await loadEnvForDeploy(serviceId);
-
     if (target.provider === 'container') {
       return await deployToContainer({
         userId, service, parsed, branch, commitSha, envVars, row, snapshot, adapter: target.adapter,
       });
     }
 
-    // --- External cloud provider (Vercel, Azure, etc.) ---------------------
-    // Push env vars BEFORE starting the build so build & runtime see them.
+    // Pin the provider-side service id so later deploys address it directly
+    // instead of matching on name — the user may rename it in the provider's
+    // dashboard, and a name lookup would then create a second service.
+    if (isRender && project.createdNow && project.id) {
+      await mergeServiceConfig(userId, projectId, serviceId, {
+        render: { ...renderCfg, serviceId: project.id, serviceName: project.name },
+      }).catch(() => {});
+    }
+    if (isRailway && project.id) {
+      // Railway also writes back the environment id, so polling a deployment
+      // does not have to re-resolve the project on every status read.
+      await mergeServiceConfig(userId, projectId, serviceId, {
+        railway: {
+          ...railwayCfg,
+          serviceId: project.id,
+          serviceName: project.name,
+          environmentId: project.railway?.environmentId ?? railwayCfg.environmentId,
+        },
+      }).catch(() => {});
+    }
+
+    // --- External cloud provider (Vercel, Azure, Render, Railway) ---------
+    // Push env vars BEFORE starting the build: every one of them snapshots a
+    // project's environment at build time, so syncing afterwards would not
+    // reach this deployment. A failure here fails the deploy on purpose —
+    // shipping without the variables the user configured produces a silently
+    // broken app.
+    //
+    // `createdNow` lets the Render adapter skip a push it already made (those
+    // values went into its create call); Railway's syncEnv is a no-op for the
+    // same reason. `context` is what the Azure adapter reads.
     const envContext = {
       serviceType: service.service_type,
       projectName: service.project_name,
       azure: azureCfg,
       ...(project.settings ?? {}),
     };
-    const envResult = await target.adapter.syncEnv({ projectId: project.id, vars: envVars, context: envContext });
+    const envResult = await target.adapter.syncEnv({
+      projectId: project.id,
+      vars: envVars,
+      context: envContext,
+      createdNow: project.createdNow,
+    });
 
     const started = await target.adapter.deploy({
       projectId: project.id,
@@ -178,10 +306,20 @@ export async function triggerDeployment(userId, projectId, serviceId, opts = {})
       rootDirectory: service.root_directory,
       buildCommand: service.build_command,
       startCommand: service.start_command,
-      target: deployTarget,
+      target: vercelTarget,
+      // --- Azure only.
       azure: azureCfg,
       envVars,
       ghToken,
+      // --- Render / Railway only. Vercel resolves the commit from `ref`.
+      commitSha,
+      // Creating a Render service already started a build of this commit;
+      // adopting it is what stops the same commit building twice.
+      initialDeployId: project.initialDeployId ?? null,
+      clearCache: Boolean(opts.clearCache),
+      // Railway's project/environment/domain ids, resolved once by
+      // ensureProject so deploy and status do not each look them up again.
+      railway: project.railway ?? null,
     });
 
     const updated = await patchDeployment(row.deployment_id, {
@@ -193,10 +331,22 @@ export async function triggerDeployment(userId, projectId, serviceId, opts = {})
           projectId: project.id,
           projectName: project.name,
           projectCreated: project.createdNow,
+          // Which project settings this deploy pushed to the provider, and
+          // anything it refused to push. Every provider freezes a project's
+          // settings into each deployment, so "what did this build actually run
+          // with" is only answerable if we record the push that preceded it.
           projectSettings: project.settings ?? null,
           deploymentId: started.providerDeploymentId,
           inspectorUrl: started.inspectorUrl,
           ...(started.meta ? { azureMeta: started.meta } : {}),
+          ...(started.renderStatus ? { readyState: started.renderStatus } : {}),
+          ...(started.railwayStatus ? { readyState: started.railwayStatus } : {}),
+          ...(started.adoptedCreateDeploy ? { adoptedCreateDeploy: true } : {}),
+          // Railway's deployment queries are filtered by project + environment
+          // + service, so polling, cancelling and env cleanup all need these
+          // later. Stored on the deployment, not read from the service, so a
+          // retargeted or re-pointed service cannot orphan this row.
+          ...(project.railway ? { railway: project.railway } : {}),
         },
         // Keys only — never values. This is an audit trail of what the build
         // was given, and config_snapshot is returned to the browser.
@@ -299,15 +449,21 @@ export async function syncDeployment(userId, row) {
   if (providerRef.type === 'container') return row;
 
   const providerType = providerRef.type || 'vercel';
-  let connection;
+  let adapter;
   try {
-    connection = await requireConnection(userId, providerType);
+    adapter = await adapterForDeployment(userId, providerRef);
   } catch {
     return row; // disconnected mid-flight; leave the row untouched
   }
+  if (!adapter) return row;
 
   try {
-    const state = await adapterFor(userId, connection).status(providerRef.deploymentId, providerRef);
+    // The whole snapshot `provider` block is the context, which is what lets
+    // one call serve every adapter: Azure reads it wholesale, Render picks
+    // `projectId` off it (its deploys nest under a service), Railway picks
+    // `railway` (its deploys are filtered by project + environment + service),
+    // and Vercel ignores it entirely.
+    const state = await adapter.status(providerRef.deploymentId, providerRef);
     if (state.status === row.status && !state.url && !state.errorMessage) return row;
     return await patchDeployment(row.deployment_id, {
       status: state.status,
@@ -322,9 +478,13 @@ export async function syncDeployment(userId, row) {
     // A deployment the provider no longer knows about is dead; anything else is
     // transient and must not corrupt a running deployment.
     if (e.status === 404) {
+      const PROVIDER_LABEL = {
+        render: 'Render', railway: 'Railway', vercel: 'Vercel', azure: 'Azure',
+      };
+      const where = PROVIDER_LABEL[providerType] ?? providerType;
       return patchDeployment(row.deployment_id, {
         status: 'failed',
-        snapshotPatch: { errorMessage: `Deployment no longer exists on ${providerType}` },
+        snapshotPatch: { errorMessage: `Deployment no longer exists on ${where}` },
         finished: true,
       });
     }
@@ -406,9 +566,21 @@ export async function getDeploymentLogs(userId, deploymentId) {
       note: 'Build logs for container deployments are not collected yet — the worker holds them.',
     };
   }
-  const providerType = providerRef.type || 'vercel';
-  const connection = await requireConnection(userId, providerType);
-  return { logs: await adapterFor(userId, connection).logs(providerRef.deploymentId, { context: providerRef }) };
+  const adapter = await adapterForDeployment(userId, providerRef);
+  if (!adapter) return { logs: [], note: 'This deployment has no log source.' };
+
+  // Spread so Render finds `projectId` and Railway finds `railway`; `context`
+  // so Azure finds the block it reads. One call, every adapter.
+  const result = await adapter.logs(providerRef.deploymentId, {
+    ...providerRef,
+    context: providerRef,
+  });
+  // Vercel and Azure return a bare array; Render and Railway return
+  // `{ logs, note }` so an empty result can explain itself (retention expired,
+  // plan restriction) — a log view that is silently empty is
+  // indistinguishable from a broken one.
+  if (Array.isArray(result)) return { logs: result };
+  return { logs: result?.logs ?? [], note: result?.note ?? null };
 }
 
 export async function cancelDeployment(userId, deploymentId) {
@@ -424,7 +596,11 @@ export async function cancelDeployment(userId, deploymentId) {
     // our row cancelled and tears down the container if one exists. A worker
     // that has already claimed the job may still finish it; the next status
     // callback will then be ignored for a terminal row.
-    const target = await resolveTarget(userId, row.service_type);
+    //
+    // Resolved from the snapshot's provider, not the service's current setting:
+    // this deployment went to the container host, so its teardown must too even
+    // if the service has since been switched to Render.
+    const target = { adapter: createKeylessAdapter('container') };
     let teardown = { skipped: 'no-container-id' };
     if (row.container_id) {
       teardown = await target.adapter.destroy({
@@ -445,10 +621,11 @@ export async function cancelDeployment(userId, deploymentId) {
     }));
   }
 
-  const providerType = providerRef.type || 'vercel';
-  const connection = await requireConnection(userId, providerType);
-  if (providerRef.deploymentId) {
-    await adapterFor(userId, connection).destroy(providerRef.deploymentId, providerRef);
+  const adapter = await adapterForDeployment(userId, providerRef);
+  if (adapter && providerRef.deploymentId) {
+    // Same whole-snapshot context as status(): Render needs the service id off
+    // it, Railway cancels by deployment id alone, Vercel ignores it.
+    await adapter.destroy(providerRef.deploymentId, providerRef);
   }
   return serializeDeployment(await patchDeployment(row.deployment_id, {
     status: 'cancelled',
@@ -465,14 +642,20 @@ export async function cancelDeployment(userId, deploymentId) {
  * Best-effort and non-fatal: the user asked to delete the service, and that
  * succeeds either way. Returns what it did so the caller can report it.
  */
-export async function teardownServiceContainers(userId, serviceId, { projectId, serviceType }) {
-  if (targetForServiceType(serviceType)?.provider !== 'container') {
-    return { queued: 0, containers: [], skipped: 'not-a-container-service' };
+export async function teardownServiceContainers(
+  userId, serviceId, { projectId, serviceType }
+) {
+  // Keyed on the service TYPE, not its current provider: only a backend ever
+  // owned a container, but one since switched to Render, Railway or Azure
+  // still owns whatever its earlier container deploys left running. Gating on
+  // the current setting would strand those. The rows decide.
+  if (!isDeployable(serviceType)) {
+    return { queued: 0, containers: [], skipped: 'not-a-deployable-service' };
   }
   const containers = await findServiceContainers(serviceId);
   if (containers.length === 0) return { queued: 0, containers: [] };
 
-  const target = await resolveTarget(userId, serviceType);
+  const target = { adapter: createKeylessAdapter('container') };
   const results = [];
   for (const c of containers) {
     try {
@@ -547,13 +730,15 @@ export async function removeProviderEnv(userId, serviceId, key) {
   const projectId = providerRef?.projectId;
   if (!projectId) return { skipped: 'never-deployed' };
 
-  const providerType = providerRef?.type || 'vercel';
-  if (providerType === 'container') return { skipped: 'inline-env' };
-
-  const connection = await requireConnection(userId, providerType);
-  return adapterFor(userId, connection).removeEnv({
+  // Read from the snapshot so the key is deleted at whichever provider is
+  // actually holding it — Vercel, Azure, Render or Railway.
+  const adapter = await adapterForDeployment(userId, providerRef);
+  // A container carries its env inside the job, so there is nothing to clean up.
+  if (!adapter) return { skipped: 'inline-env' };
+  return adapter.removeEnv({
     projectId,
     key,
+    railway: providerRef.railway ?? null,
     context: providerRef.azureMeta ?? providerRef.projectSettings ?? {},
   });
 }

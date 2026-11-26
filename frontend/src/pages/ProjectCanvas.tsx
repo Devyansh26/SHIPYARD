@@ -8,8 +8,8 @@ import {
 import { api } from '../api'
 import {
   errCode, errMessage,
-  type DatabaseProvider, type Deployment, type Project, type Service, type ServiceType,
-  type User,
+  type DatabaseProvider, type DeployTarget, type Deployment, type Project, type Service,
+  type ServiceType, type User,
 } from '../lib/types'
 import { TopBar } from '../components/TopBar'
 import { Button, Spinner } from '../components/ui'
@@ -361,7 +361,11 @@ function Canvas({ user, onLogout }: { user: User; onLogout: () => void }) {
   )
 
   const addNode = useCallback(
-    async (type: ServiceType) => {
+    // `deployTarget` is whatever the Add-service menu asked the user to choose.
+    // Null means the type has only one target (or the list could not be
+    // loaded), in which case the field is left unset and the server resolves
+    // the type's default — the same path a pre-picker service takes.
+    async (type: ServiceType, deployTarget: DeployTarget | null) => {
       if (!project) return
       setAdding(type)
       setError(null)
@@ -394,8 +398,17 @@ function Canvas({ user, onLogout }: { user: User; onLogout: () => void }) {
           serviceConfig: {
             canvas: position,
             ...(type === 'frontend' ? { vercel: { framework: 'vite' } } : {}),
+            // Whatever the user chose in the Add-service menu. No target is
+            // preferred here: the menu asked, and this records the answer.
+            ...(deployTarget ? { deployTarget } : {}),
+            // Both provider blocks are seeded regardless of the choice, so
+            // switching target later opens with sensible values rather than
+            // blank required fields.
             ...(type === 'backend'
-              ? { container: { ports: [{ containerPort: 3000, hostPort: null, protocol: 'tcp' }] } }
+              ? {
+                render: { runtime: 'node', region: 'oregon', plan: 'free', autoDeployTrigger: 'off' },
+                container: { ports: [{ containerPort: 3000, hostPort: null, protocol: 'tcp' }] },
+              }
               : {}),
             ...(type === 'database' ? { engine: 'postgres' } : {}),
           },
@@ -519,7 +532,7 @@ function Canvas({ user, onLogout }: { user: User; onLogout: () => void }) {
         {/* ------------------------------------------------------- toolbar */}
         <div className="absolute left-4 top-4 z-10 flex items-center gap-2">
           <div className="flex items-center gap-2 rounded-xl border border-line bg-surface/90 p-1.5 shadow-[0_10px_30px_-22px_rgba(0,0,0,0.5)] backdrop-blur">
-            <AddServiceMenu onPick={(t) => void addNode(t)} busy={adding} />
+            <AddServiceMenu onPick={(t, target) => void addNode(t, target)} busy={adding} />
             <span className="px-1 text-[11px] text-faint">
               {services.length} {services.length === 1 ? 'service' : 'services'}
             </span>

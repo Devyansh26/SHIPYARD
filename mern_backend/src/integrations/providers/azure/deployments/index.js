@@ -150,6 +150,10 @@ export async function deployToAzure(arm, spec) {
       repoFullName: spec.repoFullName,
       ref: spec.ref,
       ghToken: spec.ghToken,
+      // Needed so the publish step can resolve the app's real SCM hostname and,
+      // on a bare 403, report which of the handful of causes it actually is.
+      subscriptionId,
+      resourceGroup,
     });
     return {
       providerDeploymentId: res.deploymentId,
@@ -163,6 +167,12 @@ export async function deployToAzure(arm, spec) {
         location,
         resourceName: appName,
         statusUrl: res.statusUrl,
+        // The SCM host actually used, and the wrapper directory stripped from
+        // the GitHub zipball — both worth freezing into the snapshot, because
+        // "why does the site serve nothing" is answered by the second one.
+        scmHost: res.scmHost,
+        strippedRoot: res.strippedRoot,
+        ...(res.warning ? { warning: res.warning } : {}),
       },
     };
   }

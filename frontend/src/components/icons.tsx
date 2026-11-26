@@ -142,3 +142,30 @@ export function VercelMark({ size = 13, className }: IconProps) {
     </svg>
   )
 }
+
+/** Cloudflare's mark, reduced to a monochrome glyph like the rest of this file. */
+export function CloudflareMark({ size = 14, className }: IconProps) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="currentColor" className={className} aria-hidden>
+      <path d="M16.9 16.3c.15-.52.09-1-.16-1.35-.23-.32-.61-.5-1.08-.53l-8.9-.11a.18.18 0 0 1-.14-.08.18.18 0 0 1-.02-.16c.03-.08.1-.14.19-.15l8.98-.11c1.07-.05 2.22-.92 2.63-1.98l.51-1.33a.3.3 0 0 0 .02-.18 5.88 5.88 0 0 0-11.3-.6 2.65 2.65 0 0 0-4.15 2.78A3.76 3.76 0 0 0 .1 15.9c0 .18.02.36.04.54a.17.17 0 0 0 .17.15h16.33c.1 0 .18-.07.21-.16l.05-.13Zm2.8-5.9c-.08 0-.17 0-.25.02a.15.15 0 0 0-.12.1l-.35.92c-.15.52-.09 1 .16 1.35.23.32.61.5 1.08.53l1.9.11c.06 0 .11.03.14.08a.18.18 0 0 1 .02.16c-.03.08-.1.14-.19.15l-1.97.11c-1.08.05-2.23.92-2.63 1.98l-.14.37c-.03.07.02.14.1.14h6.78a.18.18 0 0 0 .17-.13 4.9 4.9 0 0 0 .18-1.32 4.33 4.33 0 0 0-4.33-4.33" />
+    </svg>
+  )
+}
+
+/** Railway's mark, reduced to a monochrome glyph like the rest of this file. */
+export function RailwayMark({ size = 13, className }: IconProps) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="currentColor" className={className} aria-hidden>
+      <path d="M1.5 9.4h14.2a4.3 4.3 0 0 0-4.2-3.3H1.5v3.3Zm0 2.1v3.3h21v-3.3h-21Zm0 5.4v3.3h10a4.3 4.3 0 0 0 4.2-3.3H1.5Z" />
+    </svg>
+  )
+}
+
+/** Render's mark, reduced to a monochrome glyph like the rest of this file. */
+export function RenderMark({ size = 13, className }: IconProps) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="currentColor" className={className} aria-hidden>
+      <path d="M3 3h7.5v4.2H3V3Zm0 6.9h7.5V21H3V9.9Zm10.5 0H21V21h-7.5V9.9Zm0-6.9H21v4.2h-7.5V3Z" />
+    </svg>
+  )
+}

@@ -38,8 +38,195 @@ export type VercelMeta = {
   target?: 'production' | 'preview'
 }
 
+/**
+ * Where a service deploys. Held at the top level of `service_config` rather
+ * than inside a provider block, because it is the thing that decides WHICH
+ * provider block applies.
+ *
+ * Deliberately a plain `string`, not a union of the targets that exist today.
+ * The list is served by `GET /api/v1/deploy-targets` from the registry in
+ * `providers/index.js`, so adding Railway there must not require editing this
+ * file — a union here would turn a backend-only change into a frontend change
+ * and a type error.
+ *
+ * Absent means the service type's default (`container` for a backend) — which
+ * now only happens for services created before the picker existed. Every new
+ * node stores an explicit choice.
+ */
+export type DeployTarget = string
+
+/** One option in the target picker, as served by GET /api/v1/deploy-targets. */
+export type DeployTargetOption = {
+  deployTarget: DeployTarget
+  provider: string
+  label: string
+  description: string
+  requiresConnection: boolean
+  /** What a legacy service with no stored choice resolves to — not a pre-selection. */
+  isDefault: boolean
+  /** False when it cannot be deployed to yet; `reason` says why. Never hidden. */
+  usable: boolean
+  /** Null for targets needing no credential (the container host). */
+  connected: boolean | null
+  reason: string | null
+}
+
+/** service_config.render — mirrors Render's create-service contract. */
+export type RenderMeta = {
+  runtime?: string | null
+  region?: string | null
+  plan?: string | null
+  healthCheckPath?: string | null
+  autoDeployTrigger?: 'off' | 'commit' | 'checksPass' | null
+  dockerfilePath?: string | null
+  dockerContext?: string | null
+  /** Written back by the control plane once Render has created the service. */
+  serviceId?: string | null
+  serviceName?: string | null
+}
+
+/** The enum lists and defaults the Render settings form renders. */
+export type RenderOptions = {
+  runtimes: string[]
+  regions: string[]
+  plans: string[]
+  autoDeployTriggers: ('off' | 'commit' | 'checksPass')[]
+  defaults: {
+    runtime: string
+    region: string
+    plan: string
+    autoDeployTrigger: string
+    healthCheckPath: string
+  }
+  consoleUrl: string
+  apiKeyUrl: string
+}
+
+/** One Render workspace an API key can reach ("owner" in their API). */
+export type RenderWorkspace = {
+  id: string
+  name: string
+  type: 'user' | 'team'
+  email?: string | null
+}
+
+/** service_config.railway — mirrors Railway's ServiceInstanceUpdateInput. */
+export type RailwayMeta = {
+  region?: string | null
+  healthcheckPath?: string | null
+  numReplicas?: number | null
+  restartPolicyType?: 'ON_FAILURE' | 'ALWAYS' | 'NEVER' | null
+  sleepApplication?: boolean | null
+  /** Which Railway environment to deploy into; projects start with "production". */
+  environmentName?: string | null
+  /** The port the generated domain routes to. Null lets Railway infer it. */
+  targetPort?: number | null
+  dockerfilePath?: string | null
+  /** Written back by the control plane once Railway has created the service. */
+  serviceId?: string | null
+  serviceName?: string | null
+  environmentId?: string | null
+}
+
+/** The enum lists and defaults the Railway settings form renders. */
+export type RailwayOptions = {
+  regions: string[]
+  restartPolicies: ('ON_FAILURE' | 'ALWAYS' | 'NEVER')[]
+  defaults: {
+    region: string
+    healthcheckPath: string
+    numReplicas: number
+    restartPolicyType: string
+    sleepApplication: boolean
+    environmentName: string
+  }
+  consoleUrl: string
+  apiKeyUrl: string
+}
+
+/** One Railway project a token can reach. Services are created inside one. */
+export type RailwayProject = { id: string; name: string }
+
+export type RailwayConnection = Connection & {
+  accountId?: string | null
+  accountName?: string | null
+  /** Null for a workspace token — those have no user identity, by design. */
+  user?: { id?: string | null; name?: string | null; email?: string | null } | null
+  /** Which kind of token this is, inferred from whether `me` was allowed. */
+  tokenKind?: 'account' | 'workspace' | null
+  /** Null when the token sees several projects and none is pinned yet. */
+  projectId: string | null
+  projects: RailwayProject[]
+  error?: { code?: string; message?: string }
+}
+
+export type RenderConnection = Connection & {
+  accountId?: string | null
+  accountName?: string | null
+  email?: string | null
+  /** Null when the key reaches several workspaces and none is pinned yet. */
+  ownerId: string | null
+  workspaces: RenderWorkspace[]
+  error?: { code?: string; message?: string }
+}
+
+/* ------------------------------------------------------- cloudflare pages */
+
+/** service_config.cloudflare — mirrors Cloudflare's Pages build_config. */
+export type CloudflarePagesMeta = {
+  framework?: string | null
+  buildCommand?: string | null
+  /** Where the built site lands. The commonest Pages misconfiguration. */
+  destinationDir?: string | null
+  rootDir?: string | null
+  buildCaching?: boolean | null
+  productionBranch?: string | null
+  /** Written back by the control plane once Cloudflare created the project. */
+  projectName?: string | null
+  subdomain?: string | null
+}
+
+/** One framework preset, carrying the build command and output dir. */
+export type CloudflareFrameworkPreset = {
+  value: string
+  label: string
+  buildCommand: string
+  destinationDir: string
+}
+
+export type CloudflareOptions = {
+  frameworks: CloudflareFrameworkPreset[]
+  defaults: {
+    framework: string
+    buildCommand: string
+    destinationDir: string
+    rootDir: string
+    buildCaching: boolean
+    productionBranch: string
+  }
+  consoleUrl: string
+  apiKeyUrl: string
+  /** The one-time GitHub App install the API cannot perform. */
+  gitSetupUrl: string
+}
+
+/** One Cloudflare account a token can reach. Pages projects live in one. */
+export type CloudflareAccount = { id: string; name: string }
+
+export type CloudflareConnection = Connection & {
+  accountName?: string | null
+  tokenStatus?: string | null
+  /** Null when the token sees several accounts and none is pinned yet. */
+  cloudflareAccountId: string | null
+  accounts: CloudflareAccount[]
+  error?: { code?: string; message?: string }
+}
+
+/* ------------------------------------------------------------------ azure */
+
 export type AzureServiceKind = 'app_service' | 'container_apps' | 'static_web_apps'
 
+/** service_config.azure — frontend or backend; Azure supports both. */
 export type AzureMeta = {
   serviceKind?: AzureServiceKind
   subscriptionId?: string | null
@@ -88,14 +275,32 @@ export type Service = {
   startCommand: string | null
   serviceConfig: {
     canvas?: CanvasMeta
-    /** selected deployment provider override ('vercel' | 'container' | 'azure') */
-    provider?: 'vercel' | 'container' | 'azure'
+    /**
+     * Which provider below applies. `provider` is canonical; `deployTarget` is
+     * the legacy spelling the backend target picker wrote before the Azure and
+     * Render/Railway branches merged. The control plane reads either, so both
+     * are typed — write `provider` in new code.
+     *
+     * Deliberately `DeployTarget` (a plain string), not a union of today's
+     * providers: the list is served by `GET /api/v1/deploy-targets` from the
+     * server registry, so registering a provider there must not require
+     * editing this file.
+     */
+    provider?: DeployTarget
+    /** @deprecated Read-only compatibility — write `provider` instead. */
+    deployTarget?: DeployTarget
     /** frontend services only */
     vercel?: VercelMeta
     /** azure deployments (frontend or backend) */
     azure?: AzureMeta
-    /** backend services only */
+    /** backend services on the container target */
     container?: ContainerMeta
+    /** backend services on the Render target */
+    render?: RenderMeta
+    /** backend services on the Railway target */
+    railway?: RailwayMeta
+    /** frontend services on the Cloudflare Pages target */
+    cloudflare?: CloudflarePagesMeta
     /** database services only */
     engine?: string
     /** Databases this service reads, keyed by the database node's service id. */
@@ -251,6 +456,24 @@ export type Repo = {
 export type ApiError = {
   status: number
   body?: { error?: { code?: string; message?: string } } | null
+}
+
+/**
+ * Which provider a service deploys to, as the server resolves it.
+ *
+ * Reads `provider` then the legacy `deployTarget`, so a service created by
+ * either branch's UI answers correctly. Mirrors `providerChoiceOf()` in
+ * `integrations/core/registry/index.js` — the two must agree, or the UI shows
+ * one target's settings while the deploy goes somewhere else.
+ *
+ * Null means "no explicit choice": the server falls back to the service
+ * type's default (`vercel` for a frontend, `container` for a backend).
+ */
+export function providerOf(service: {
+  serviceConfig?: { provider?: string; deployTarget?: string }
+}): string | null {
+  const raw = service.serviceConfig?.provider ?? service.serviceConfig?.deployTarget
+  return typeof raw === 'string' && raw.trim() !== '' ? raw.trim() : null
 }
 
 export function errCode(e: unknown): string | undefined {

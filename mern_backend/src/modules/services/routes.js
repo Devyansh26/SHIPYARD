@@ -7,6 +7,39 @@ import { SERVICE_TYPES } from './serviceTypes.js';
 import { listServices, createService, getService, updateService, deleteService, updateServiceCanvas } from './repository.js';
 import { teardownServiceContainers } from '../deployments/service.js';
 import { consumersOfProvider, kindForProviderType } from '../links/service.js';
+import {
+  isAllowedTarget, allowedTargetsForServiceType, providerChoiceOf,
+} from '../providers/index.js';
+
+/**
+ * Rejects a per-service provider choice the service type does not allow.
+ *
+ * Both spellings are checked, because two branches wrote different keys:
+ * `provider` is canonical (Azure's UI) and `deployTarget` is the legacy one
+ * the backend target picker wrote. `providerChoiceOf` reads whichever is set.
+ *
+ * Resolution falls back to the type's default for an unknown value, which is
+ * safe but silent — a typo would deploy somewhere the user did not choose and
+ * look like a bug in the picker. Failing loudly here is cheaper to diagnose.
+ *
+ * Absent is always fine: that is a legacy service, and the default covers it.
+ */
+function assertDeployTarget(serviceType, serviceConfig) {
+  const chosen = providerChoiceOf(serviceConfig);
+  if (chosen === null) return;
+  if (!isAllowedTarget(serviceType, chosen)) {
+    const allowed = allowedTargetsForServiceType(serviceType).map((t) => t.provider);
+    const e = new Error(
+      `Provider "${chosen}" is not available for a ${serviceType} service. `
+      + (allowed.length > 0
+        ? `Allowed: ${allowed.join(', ')}.`
+        : `A ${serviceType} service does not deploy anywhere.`)
+    );
+    e.status = 400;
+    e.code = 'INVALID_DEPLOY_TARGET';
+    throw e;
+  }
+}
 
 // NOT NULL in the schema: service_name, service_type, repository, branch,
 // root_directory, service_config. Those can never be patched to null.
@@ -80,6 +113,7 @@ router.get('/', asyncHandler(async (req, res) => {
 }));
 
 router.post('/', validate(createSchema), asyncHandler(async (req, res) => {
+  assertDeployTarget(req.body.serviceType, req.body.serviceConfig);
   const service = await createService(req.userId, req.params.projectId, req.body);
   res.status(201).json({ service });
 }));
@@ -89,7 +123,14 @@ router.get('/:serviceId', asyncHandler(async (req, res) => {
 }));
 
 router.patch('/:serviceId', validate(patchSchema), asyncHandler(async (req, res) => {
-  res.json({ service: await updateService(req.userId, req.params.projectId, req.params.serviceId, req.body) });
+  const { projectId, serviceId } = req.params;
+  if (providerChoiceOf(req.body.serviceConfig) !== null) {
+    // `service_type` cannot be patched, so the stored row is the authority on
+    // which targets are allowed.
+    const current = await getService(req.userId, projectId, serviceId);
+    assertDeployTarget(req.body.serviceType ?? current.serviceType, req.body.serviceConfig);
+  }
+  res.json({ service: await updateService(req.userId, projectId, serviceId, req.body) });
 }));
 
 // Canvas layout is its own endpoint rather than a serviceConfig PATCH: the

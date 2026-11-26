@@ -12,9 +12,11 @@ export const TYPE_META: Record<ServiceType, { label: string; hint: string; deplo
   },
   backend: {
     label: 'Backend',
-    // Backend services go to the container host via the Container Management
-    // Service, NOT to Vercel — see mern_backend providers/container.js.
-    hint: 'API or worker — runs as a container on your own host',
+    // Backend services never go to Vercel. They go to Render (the user's own
+    // account) or to the container host via the Container Management Service —
+    // a per-service choice in service_config.deployTarget. See
+    // mern_backend modules/render/ and providers/container.js.
+    hint: 'API or worker — deploys to your Render account, or your own container host',
     deployable: true,
   },
   database: {
