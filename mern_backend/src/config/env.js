@@ -18,6 +18,12 @@ const envSchema = z.object({
   VERCEL_CLIENT_SECRET: z.string().min(1).optional(),
   VERCEL_INTEGRATION_SLUG: z.string().min(1).optional(),
   VERCEL_REDIRECT_URI: z.string().url().optional(),
+  // Microsoft Azure OAuth 2.0 integration — optional: without it, connecting
+  // Azure via OAuth returns 501 AZURE_OAUTH_NOT_CONFIGURED.
+  AZURE_CLIENT_ID: z.string().min(1).optional(),
+  AZURE_CLIENT_SECRET: z.string().min(1).optional(),
+  AZURE_REDIRECT_URI: z.string().url().optional(),
+  AZURE_TENANT_ID: z.string().min(1).default('common'),
   // Container Management Service — the target for `backend` services. Optional
   // so the control plane still boots without it; a backend deploy then fails
   // with 501 CONTAINER_TARGET_NOT_CONFIGURED instead of at startup.
@@ -33,6 +39,10 @@ export const isProd = env.NODE_ENV === 'production';
 
 export const vercelOAuthConfigured = Boolean(
   env.VERCEL_CLIENT_ID && env.VERCEL_CLIENT_SECRET && env.VERCEL_INTEGRATION_SLUG && env.VERCEL_REDIRECT_URI
+);
+
+export const azureOAuthConfigured = Boolean(
+  env.AZURE_CLIENT_ID && env.AZURE_CLIENT_SECRET && env.AZURE_REDIRECT_URI
 );
 
 // One secret can serve both directions of the control-plane <-> CMS link.

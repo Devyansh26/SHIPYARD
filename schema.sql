@@ -46,12 +46,16 @@ CREATE TRIGGER trg_users_updated_at
 -- =============================================================================
 -- 3. PROVIDER CONNECTIONS
 -- =============================================================================
--- Stores credentials/authorizations for cloud targets (Vercel, Render, Railway,
--- Neon, Atlas, Homelab) — plus 'azure', which exists in the live database and
--- has an active row but is referenced NOWHERE in this repository's code. It was
--- added by hand. It is kept in the CHECK list because dropping a value orphans
--- whatever rows use it, and `services.provider_connection_id` references them.
--- Removing it is a deliberate data decision, not a cleanup.
+-- Stores credentials/authorizations for cloud targets (Vercel, Render,
+-- Railway, Azure, Neon, Atlas, Homelab).
+--
+-- This list is the UNION of every provider any branch registers. It got that
+-- way the hard way: 'azure' was in the live database's constraint, with an
+-- active row, before the Azure branch landed here — so a migration listing
+-- only the providers one branch knew about would have dropped it, failed
+-- revalidation against that row and rolled back. Dropping a value orphans
+-- whatever rows use it, and `services.provider_connection_id` references
+-- them, so narrowing this list is a deliberate data decision, never a tidy-up.
 --
 -- NOTE: `IF NOT EXISTS` does NOT widen the CHECK on a database that already
 -- has this table, so adding a provider here is not enough for an existing
@@ -61,16 +65,18 @@ CREATE TRIGGER trg_users_updated_at
 --     DROP CONSTRAINT IF EXISTS provider_connections_provider_type_check;
 --   ALTER TABLE provider_connections
 --     ADD CONSTRAINT provider_connections_provider_type_check
---     CHECK (provider_type IN ('vercel', 'render', 'railway', 'neon', 'atlas', 'homelab', 'azure'));
+--     CHECK (provider_type IN ('vercel', 'render', 'railway', 'cloudflare', 'azure', 'neon', 'atlas', 'homelab'));
 --
 -- Committed as a runnable file at
 -- `mern_backend/src/modules/railway/migration.sql`, which lists every provider
--- and so covers Render too. Without it, connecting Render or Railway fails with
--- a 23514 check_violation.
+-- (so it covers Render and Azure too) and carries a pre-flight guard that
+-- names any value already in the table that the new list would reject.
+-- Without it, connecting Render, Railway or Azure fails with a
+-- 23514 check_violation.
 CREATE TABLE IF NOT EXISTS provider_connections (
     connection_id VARCHAR(64) PRIMARY KEY,
     user_id VARCHAR(64) NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
-    provider_type VARCHAR(50) NOT NULL CHECK (provider_type IN ('vercel', 'render', 'railway', 'neon', 'atlas', 'homelab', 'azure')),
+    provider_type VARCHAR(50) NOT NULL CHECK (provider_type IN ('vercel', 'render', 'railway', 'cloudflare', 'azure', 'neon', 'atlas', 'homelab')),
     external_account_id VARCHAR(255),
     credentials_ref TEXT NOT NULL, -- Encrypted format: enc:v1:<iv>:<tag>:<ciphertext>
     connection_status VARCHAR(50) NOT NULL DEFAULT 'active' CHECK (connection_status IN ('active', 'revoked', 'error')),

@@ -2,13 +2,15 @@ import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react
 import { api } from '../api'
 import {
   errCode, errMessage,
-  type ContainerMeta, type DeployTarget, type DeployTargetOption, type PortMapping,
-  type RailwayMeta, type RailwayOptions, type RenderMeta, type RenderOptions,
-  type Service, type VercelMeta,
+  providerOf,
+  type AzureMeta, type CloudflareOptions, type CloudflarePagesMeta, type ContainerMeta,
+  type DeployTarget, type DeployTargetOption, type PortMapping, type RailwayMeta,
+  type RailwayOptions, type RenderMeta, type RenderOptions, type Service, type VercelMeta,
 } from '../lib/types'
 import { Button, Field, Spinner } from '../components/ui'
-import { PlusIcon, RailwayMark, RenderMark, TrashIcon } from '../components/icons'
+import { CloudflareMark, PlusIcon, RailwayMark, RenderMark, TrashIcon } from '../components/icons'
 import { TYPE_META, inputCls } from '../lib/meta'
+import AzureServiceSettings from '../integrations/AzureServiceSettings'
 
 /**
  * Settings differ per service type because the deployment targets differ:
@@ -70,6 +72,28 @@ const FALLBACK_TARGETS: DeployTargetOption[] = [
     connected: null,
     reason: null,
   },
+  {
+    deployTarget: 'azure',
+    provider: 'azure',
+    label: 'Azure',
+    description: 'Runs in your own Azure subscription.',
+    requiresConnection: true,
+    isDefault: false,
+    usable: true,
+    connected: null,
+    reason: null,
+  },
+  {
+    deployTarget: 'cloudflare',
+    provider: 'cloudflare',
+    label: 'Cloudflare Pages',
+    description: 'Builds and serves your frontend from your own Cloudflare account.',
+    requiresConnection: true,
+    isDefault: false,
+    usable: true,
+    connected: null,
+    reason: null,
+  },
 ]
 
 const RAILWAY_REGION_LABEL: Record<string, string> = {
@@ -88,14 +112,10 @@ const RESTART_POLICY_LABEL: Record<string, string> = {
   NEVER: 'Never — leave it stopped',
 }
 
-/**
- * Absent `deployTarget` means the type's default — `container` for a backend.
- * Only pre-picker services hit this; every new node stores its choice.
- */
-function effectiveTarget(service: Service): DeployTarget {
-  const stored = service.serviceConfig?.deployTarget
-  return typeof stored === 'string' && stored !== '' ? stored : 'container'
-}
+/* `providerOf(service)` in lib/types.ts replaces what used to be a local
+ * `effectiveTarget()` here: it reads the canonical `provider` key and falls
+ * back to the legacy `deployTarget`, and the server's `providerChoiceOf()`
+ * does exactly the same — so the form and the deploy agree. */
 
 const REGION_LABEL: Record<string, string> = {
   oregon: 'Oregon (US West)',
@@ -160,8 +180,6 @@ export type FormState = {
   healthPath: string
   healthPort: string
   engine: string
-  // backend only — which target the fields below belong to
-  deployTarget: DeployTarget
   // backend / Render only
   renderRuntime: string
   renderRegion: string
@@ -179,6 +197,13 @@ export type FormState = {
   railwayEnvironmentName: string
   railwayTargetPort: string
   railwayDockerfilePath: string
+  // frontend / Cloudflare Pages only
+  cfFramework: string
+  cfBuildCommand: string
+  cfDestinationDir: string
+  cfRootDir: string
+  cfProductionBranch: string
+  cfBuildCaching: boolean
 }
 
 type SetField = (k: keyof FormState) => (v: string) => void
@@ -236,12 +261,52 @@ export function buildServiceConfig(
   service: Service,
   form: FormState,
   ports: PortRow[],
+  // A plain string, not a union of today's providers: the list is served by
+  // GET /api/v1/deploy-targets from the server registry, so registering one
+  // there must not turn into a type error here.
+  provider?: DeployTarget,
+  azure?: AzureMeta,
 ): Record<string, unknown> {
   const config: Record<string, unknown> = { ...(service.serviceConfig ?? {}) }
   const vercel: VercelMeta = service.serviceConfig?.vercel ?? {}
   const container: ContainerMeta = service.serviceConfig?.container ?? {}
   const render: RenderMeta = service.serviceConfig?.render ?? {}
   const railway: RailwayMeta = service.serviceConfig?.railway ?? {}
+  const cloudflare: CloudflarePagesMeta = service.serviceConfig?.cloudflare ?? {}
+
+  if (service.serviceType === 'database') {
+    config.engine = form.engine
+    return config
+  }
+
+  const resolvedProvider = provider ?? (service.serviceType === 'frontend' ? 'vercel' : 'container')
+  config.provider = resolvedProvider
+
+  if (resolvedProvider === 'azure') {
+    config.azure = {
+      ...(service.serviceConfig?.azure ?? {}),
+      ...(azure ?? {}),
+    }
+    return config
+  }
+
+  if (resolvedProvider === 'cloudflare') {
+    config.cloudflare = {
+      // Spread first to keep `projectName` / `subdomain`, written back by the
+      // control plane once Cloudflare created the project.
+      ...cloudflare,
+      // Sent as-is, NOT `|| null`: '' is the real "None / custom" preset key,
+      // and nulling it would read as "no choice" and restore the default.
+      framework: form.cfFramework,
+      buildCommand: form.cfBuildCommand.trim() || null,
+      destinationDir: form.cfDestinationDir.trim() || null,
+      rootDir: form.cfRootDir.trim() || null,
+      productionBranch: form.cfProductionBranch.trim() || null,
+      buildCaching: form.cfBuildCaching,
+    }
+    // The `vercel` block is left as it was, so switching back keeps it.
+    return config
+  }
 
   if (service.serviceType === 'frontend') {
     config.vercel = {
@@ -253,67 +318,66 @@ export function buildServiceConfig(
     return config
   }
 
-  if (service.serviceType === 'backend') {
-    config.deployTarget = form.deployTarget
-
-    if (form.deployTarget === 'railway') {
-      const replicas = Number.parseInt(form.railwayNumReplicas, 10)
-      const targetPort = Number.parseInt(form.railwayTargetPort, 10)
-      config.railway = {
-        // Spread first to keep `serviceId` / `environmentId`, written back by
-        // the control plane once Railway has created the service. Losing them
-        // would make the next deploy match on name and could duplicate a
-        // service the user renamed in Railway's dashboard.
-        ...railway,
-        region: form.railwayRegion || null,
-        healthcheckPath: form.railwayHealthcheckPath.trim() || null,
-        numReplicas: Number.isFinite(replicas) && replicas >= 1 ? replicas : 1,
-        restartPolicyType: (form.railwayRestartPolicyType || 'ON_FAILURE') as RailwayMeta['restartPolicyType'],
-        sleepApplication: form.railwaySleepApplication,
-        environmentName: form.railwayEnvironmentName.trim() || 'production',
-        targetPort: Number.isFinite(targetPort) && targetPort >= 1 && targetPort <= 65535
-          ? targetPort
-          : null,
-        dockerfilePath: form.railwayDockerfilePath.trim() || null,
-      }
-      return config
+  // Backend providers. `resolvedProvider` (set above, and written to
+  // `config.provider`) is the single source of truth — there is no separate
+  // `deployTarget` key any more, though the control plane still reads one on
+  // services saved before these branches merged.
+  //
+  // Each branch writes ONLY its own provider's block, so switching target
+  // keeps the others: flipping back must not have discarded port mappings or
+  // a region.
+  if (resolvedProvider === 'railway') {
+    const replicas = Number.parseInt(form.railwayNumReplicas, 10)
+    const targetPort = Number.parseInt(form.railwayTargetPort, 10)
+    config.railway = {
+      // Spread first to keep `serviceId` / `environmentId`, written back by
+      // the control plane once Railway has created the service. Losing them
+      // would make the next deploy match on name and could duplicate a
+      // service the user renamed in Railway's dashboard.
+      ...railway,
+      region: form.railwayRegion || null,
+      healthcheckPath: form.railwayHealthcheckPath.trim() || null,
+      numReplicas: Number.isFinite(replicas) && replicas >= 1 ? replicas : 1,
+      restartPolicyType: (form.railwayRestartPolicyType || 'ON_FAILURE') as RailwayMeta['restartPolicyType'],
+      sleepApplication: form.railwaySleepApplication,
+      environmentName: form.railwayEnvironmentName.trim() || 'production',
+      targetPort: Number.isFinite(targetPort) && targetPort >= 1 && targetPort <= 65535
+        ? targetPort
+        : null,
+      dockerfilePath: form.railwayDockerfilePath.trim() || null,
     }
-
-    if (form.deployTarget === 'render') {
-      config.render = {
-        // `serviceId` / `serviceName` are written by the control plane once
-        // Render has created the service. Spreading the stored block first
-        // keeps them — losing the id would make the next deploy match on name,
-        // and a service renamed in Render's dashboard would then be duplicated.
-        ...render,
-        runtime: form.renderRuntime || null,
-        region: form.renderRegion || null,
-        plan: form.renderPlan || null,
-        healthCheckPath: form.renderHealthCheckPath.trim() || null,
-        autoDeployTrigger: (form.renderAutoDeployTrigger || 'off') as RenderMeta['autoDeployTrigger'],
-        dockerfilePath: form.renderDockerfilePath.trim() || null,
-        dockerContext: form.renderDockerContext.trim() || null,
-      }
-      // The `container` block is left exactly as it was: switching back to the
-      // container host must not have silently discarded its port mappings.
-      return config
-    }
-
-    const resources = form.cpuLimit || form.memoryLimit
-      ? { cpuLimit: form.cpuLimit || null, memoryLimit: form.memoryLimit || null }
-      : null
-    const healthPort = Number.parseInt(form.healthPort, 10)
-    const healthCheck = form.healthPath.trim() || form.healthPort.trim()
-      ? {
-        path: form.healthPath.trim() || '/health',
-        port: Number.isFinite(healthPort) ? healthPort : null,
-      }
-      : null
-    config.container = { ...container, ports: fromPortRows(ports), resources, healthCheck }
     return config
   }
 
-  config.engine = form.engine
+  if (resolvedProvider === 'render') {
+    config.render = {
+      // Same reason as Railway's spread: `serviceId` / `serviceName` are
+      // written by the control plane once Render has created the service, and
+      // losing the id would make the next deploy match on name and duplicate
+      // a service renamed in Render's dashboard.
+      ...render,
+      runtime: form.renderRuntime || null,
+      region: form.renderRegion || null,
+      plan: form.renderPlan || null,
+      healthCheckPath: form.renderHealthCheckPath.trim() || null,
+      autoDeployTrigger: (form.renderAutoDeployTrigger || 'off') as RenderMeta['autoDeployTrigger'],
+      dockerfilePath: form.renderDockerfilePath.trim() || null,
+      dockerContext: form.renderDockerContext.trim() || null,
+    }
+    return config
+  }
+
+  const resources = form.cpuLimit || form.memoryLimit
+    ? { cpuLimit: form.cpuLimit || null, memoryLimit: form.memoryLimit || null }
+    : null
+  const healthPort = Number.parseInt(form.healthPort, 10)
+  const healthCheck = form.healthPath.trim() || form.healthPort.trim()
+    ? {
+      path: form.healthPath.trim() || '/health',
+      port: Number.isFinite(healthPort) ? healthPort : null,
+    }
+    : null
+  config.container = { ...container, ports: fromPortRows(ports), resources, healthCheck }
   return config
 }
 
@@ -329,7 +393,22 @@ export default function SettingsTab({
   const container: ContainerMeta = service.serviceConfig?.container ?? {}
   const render: RenderMeta = service.serviceConfig?.render ?? {}
   const railway: RailwayMeta = service.serviceConfig?.railway ?? {}
+  const cloudflare: CloudflarePagesMeta = service.serviceConfig?.cloudflare ?? {}
   const kind = service.serviceType
+  const defaultProvider = kind === 'frontend' ? 'vercel' : 'container'
+  // A plain string, not a union: the option list comes from
+  // `GET /api/v1/deploy-targets`, so registering a provider on the server must
+  // not require editing this file. `providerOf` reads the canonical
+  // `provider` key and falls back to the legacy `deployTarget`.
+  const [provider, setProvider] = useState<DeployTarget>(
+    providerOf(service) ?? defaultProvider,
+  )
+  const [azure, setAzure] = useState<AzureMeta>(
+    service.serviceConfig?.azure ?? {
+      serviceKind: kind === 'frontend' ? 'static_web_apps' : 'app_service',
+      location: 'eastus',
+    },
+  )
 
   const [form, setForm] = useState<FormState>({
     name: service.name,
@@ -350,8 +429,6 @@ export default function SettingsTab({
     healthPort: container.healthCheck?.port == null ? '' : String(container.healthCheck.port),
     // database only
     engine: String(service.serviceConfig?.engine ?? 'postgres'),
-    // backend: which target these fields belong to
-    deployTarget: effectiveTarget(service),
     // backend / Render only
     renderRuntime: render.runtime ?? 'node',
     renderRegion: render.region ?? 'oregon',
@@ -369,12 +446,20 @@ export default function SettingsTab({
     railwayEnvironmentName: railway.environmentName ?? 'production',
     railwayTargetPort: railway.targetPort == null ? '' : String(railway.targetPort),
     railwayDockerfilePath: railway.dockerfilePath ?? '',
+    // frontend / Cloudflare Pages only
+    cfFramework: cloudflare.framework ?? 'vite',
+    cfBuildCommand: cloudflare.buildCommand ?? '',
+    cfDestinationDir: cloudflare.destinationDir ?? '',
+    cfRootDir: cloudflare.rootDir ?? '',
+    cfProductionBranch: cloudflare.productionBranch ?? '',
+    cfBuildCaching: cloudflare.buildCaching !== false,
   })
   const [ports, setPorts] = useState<PortRow[]>(() => toPortRows(container.ports))
   const [branches, setBranches] = useState<string[]>([])
   const [deployTargets, setDeployTargets] = useState<DeployTargetOption[]>(FALLBACK_TARGETS)
   const [renderOptions, setRenderOptions] = useState<RenderOptions | null>(null)
   const [railwayOptions, setRailwayOptions] = useState<RailwayOptions | null>(null)
+  const [cloudflareOptions, setCloudflareOptions] = useState<CloudflareOptions | null>(null)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [saved, setSaved] = useState(false)
@@ -403,14 +488,24 @@ export default function SettingsTab({
     }
   }, [])
 
+  const loadCloudflareOptions = useCallback(async () => {
+    try {
+      const r = await api.cloudflareOptions()
+      setCloudflareOptions(r.options as CloudflareOptions)
+    } catch {
+      setCloudflareOptions(null)
+    }
+  }, [])
+
   useEffect(() => {
-    if (kind !== 'backend') return
-    if (form.deployTarget === 'render' && !renderOptions) void loadRenderOptions()
-    if (form.deployTarget === 'railway' && !railwayOptions) void loadRailwayOptions()
+    if (provider === 'render' && !renderOptions) void loadRenderOptions()
+    if (provider === 'railway' && !railwayOptions) void loadRailwayOptions()
+    if (provider === 'cloudflare' && !cloudflareOptions) void loadCloudflareOptions()
   }, [
-    kind, form.deployTarget,
+    provider,
     renderOptions, loadRenderOptions,
     railwayOptions, loadRailwayOptions,
+    cloudflareOptions, loadCloudflareOptions,
   ])
 
   // Same reason as the Render enums: the target list lives in the server
@@ -418,7 +513,7 @@ export default function SettingsTab({
   useEffect(() => {
     if (kind !== 'backend') return
     let alive = true
-    api.deployTargets('backend')
+    api.deployTargets(kind)
       .then((r) => {
         const list = (r.targets ?? []) as DeployTargetOption[]
         if (alive && list.length > 0) setDeployTargets(list)
@@ -452,14 +547,18 @@ export default function SettingsTab({
     setSaved(false)
   }
 
-  const activeTarget = deployTargets.find((t) => t.deployTarget === form.deployTarget) ?? null
+  const activeTarget = deployTargets.find((t) => t.provider === provider) ?? null
 
   // Render and Railway both allocate the port themselves (the app must read
   // $PORT), so port mappings are a container-target concern only and must not
   // block a save on either.
-  const isRenderTarget = kind === 'backend' && form.deployTarget === 'render'
-  const isRailwayTarget = kind === 'backend' && form.deployTarget === 'railway'
-  const isContainerTarget = kind === 'backend' && !isRenderTarget && !isRailwayTarget
+  const isCloudflareTarget = kind === 'frontend' && provider === 'cloudflare'
+  const isRenderTarget = kind === 'backend' && provider === 'render'
+  const isRailwayTarget = kind === 'backend' && provider === 'railway'
+  // Azure draws its own fields (AzureServiceSettings), so the container field
+  // set is only for a backend that is on none of the hosted providers.
+  const isContainerTarget = kind === 'backend'
+    && !isRenderTarget && !isRailwayTarget && provider !== 'azure'
   const portErrors = isContainerTarget ? ports.map(portRowError) : []
   const hasPortError = portErrors.some((e) => e !== null)
 
@@ -474,7 +573,7 @@ export default function SettingsTab({
     setError(null)
     setSaving(true)
     try {
-      const serviceConfig = buildServiceConfig(service, form, ports)
+      const serviceConfig = buildServiceConfig(service, form, ports, provider, azure)
 
       const r = await api.updateService(projectId, service.id, {
         name: form.name.trim(),
@@ -570,6 +669,63 @@ export default function SettingsTab({
         </Section>
       ) : (
         <>
+          <Section title="Deployment provider">
+            <Field
+              label="Cloud provider"
+              hint="Changing this does not move anything already deployed — the old deployment keeps running where it is until you delete it there."
+            >
+              <select
+                className={inputCls}
+                value={provider}
+                onChange={(e) => {
+                  setProvider(e.target.value)
+                  setSaved(false)
+                }}
+              >
+                {/* Options come from the server registry, so a provider added
+                    there appears here with no change to this file. */}
+                {deployTargets.map((t) => (
+                  <option key={t.provider} value={t.provider}>{t.label}</option>
+                ))}
+                {/* A provider the server no longer offers must still show as
+                    the current value, or saving would silently retarget this
+                    service to whatever happens to be first. */}
+                {!deployTargets.some((t) => t.provider === provider) && (
+                  <option value={provider}>{provider} (unavailable)</option>
+                )}
+              </select>
+            </Field>
+            {activeTarget && (
+              <p className="rounded-lg border border-line bg-sunken px-2.5 py-2 text-[11px] leading-relaxed text-muted">
+                {activeTarget.description}
+              </p>
+            )}
+            {activeTarget && !activeTarget.usable && activeTarget.reason && (
+              <p className="rounded-lg border border-line-strong bg-sunken px-3 py-2 text-[11px] leading-relaxed text-muted">
+                {activeTarget.reason}
+              </p>
+            )}
+            {provider !== (providerOf(service) ?? defaultProvider) && (
+              <p className="rounded-lg border border-line-strong bg-sunken px-3 py-2 text-[11px] leading-relaxed text-muted">
+                Save to apply. The next deploy will go to{' '}
+                <strong className="font-medium text-ink">
+                  {activeTarget?.label ?? provider}
+                </strong>
+                ; settings for the other providers are kept, not discarded.
+              </p>
+            )}
+            {provider === 'azure' && (
+              <AzureServiceSettings
+                serviceType={kind}
+                value={azure}
+                onChange={(next) => {
+                  setAzure(next)
+                  setSaved(false)
+                }}
+              />
+            )}
+          </Section>
+
           <Section title="Source">
             <Field label="Repository" hint="owner/repo, or a full GitHub URL.">
               <input className={inputCls} value={form.repository} onChange={(e) => set('repository')(e.target.value)} />
@@ -594,7 +750,9 @@ export default function SettingsTab({
             </Field>
           </Section>
 
-          {kind === 'frontend' ? (
+          {isCloudflareTarget ? (
+            <CloudflareFields form={form} set={set} setBool={setBool} options={cloudflareOptions} />
+          ) : kind === 'frontend' ? (
             <Section title="Build">
               <Field
                 label="Framework preset"
@@ -622,49 +780,7 @@ export default function SettingsTab({
             </Section>
           ) : (
             <>
-              <Section title="Deploy target">
-                <Field
-                  label="Where this service runs"
-                  hint="Changing this does not move anything already deployed — the old deployment keeps running where it is until you delete it there."
-                >
-                  <select
-                    className={inputCls}
-                    value={form.deployTarget}
-                    onChange={(e) => set('deployTarget')(e.target.value)}
-                  >
-                    {deployTargets.map((t) => (
-                      <option key={t.deployTarget} value={t.deployTarget}>{t.label}</option>
-                    ))}
-                    {/* A target the server no longer offers must still show as
-                        the current value, or saving would silently retarget
-                        this service to whatever happens to be first. */}
-                    {!deployTargets.some((t) => t.deployTarget === form.deployTarget) && (
-                      <option value={form.deployTarget}>{form.deployTarget} (unavailable)</option>
-                    )}
-                  </select>
-                </Field>
-                {activeTarget && (
-                  <p className="rounded-lg border border-line bg-sunken px-2.5 py-2 text-[11px] leading-relaxed text-muted">
-                    {activeTarget.description}
-                  </p>
-                )}
-                {activeTarget && !activeTarget.usable && activeTarget.reason && (
-                  <p className="rounded-lg border border-line-strong bg-sunken px-3 py-2 text-[11px] leading-relaxed text-muted">
-                    {activeTarget.reason}
-                  </p>
-                )}
-                {form.deployTarget !== effectiveTarget(service) && (
-                  <p className="rounded-lg border border-line-strong bg-sunken px-3 py-2 text-[11px] leading-relaxed text-muted">
-                    Save to apply. The next deploy will go to{' '}
-                    <strong className="font-medium text-ink">
-                      {activeTarget?.label ?? form.deployTarget}
-                    </strong>
-                    ; settings for the other target are kept, not discarded.
-                  </p>
-                )}
-              </Section>
-
-              {isRailwayTarget ? (
+              {provider === 'azure' ? null : isRailwayTarget ? (
                 <RailwayFields
                   form={form}
                   set={set}
@@ -904,6 +1020,150 @@ function BackendFields({
           Leave both empty to skip the check. The deployment is only marked live
           once this responds — which is also what releases the previous
           container on a redeploy.
+        </p>
+      </Section>
+    </>
+  )
+}
+
+/* ------------------------------------------------------- cloudflare fields */
+
+/**
+ * Cloudflare Pages build settings.
+ *
+ * Deliberately absent: region, instance plan, port, health check. Pages builds
+ * on Cloudflare's runners and serves the output directory from their edge, so
+ * none of those exist — showing them would be fields that silently do nothing.
+ *
+ * The framework preset fills the build command and output directory, because
+ * `destination_dir` is the single most common Pages misconfiguration: get it
+ * wrong and Cloudflare publishes an empty directory, so the deploy goes green
+ * and the site 404s with nothing in the log to explain it.
+ */
+function CloudflareFields({
+  form, set: field, setBool, options,
+}: {
+  form: FormState
+  set: SetField
+  setBool: (k: keyof FormState) => (v: boolean) => void
+  options: CloudflareOptions | null
+}) {
+  const presets = options?.frameworks ?? [
+    { value: '', label: 'None / custom', buildCommand: '', destinationDir: '' },
+    { value: 'vite', label: 'Vite', buildCommand: 'npm run build', destinationDir: 'dist' },
+  ]
+  const preset = presets.find((p) => p.value === form.cfFramework) ?? null
+
+  return (
+    <>
+      <Section title="Build">
+        <Field
+          label="Framework preset"
+          hint="Fills the build command and output directory below with the values Cloudflare's own dashboard would pick."
+        >
+          <select
+            className={inputCls}
+            value={form.cfFramework}
+            onChange={(e) => {
+              const next = presets.find((p) => p.value === e.target.value)
+              field('cfFramework')(e.target.value)
+              // Only overwrite fields the user has not customised, so picking a
+              // preset never silently discards a hand-written command.
+              if (next && form.cfBuildCommand.trim() === '') field('cfBuildCommand')(next.buildCommand)
+              if (next && form.cfDestinationDir.trim() === '') field('cfDestinationDir')(next.destinationDir)
+            }}
+          >
+            {presets.map((p) => <option key={p.value} value={p.value}>{p.label}</option>)}
+          </select>
+        </Field>
+
+        <Field
+          label="Build command"
+          hint={preset?.buildCommand
+            ? `Leave empty to use the preset's "${preset.buildCommand}".`
+            : 'The command Cloudflare runs to build the site.'}
+        >
+          <input
+            className={inputCls}
+            placeholder={preset?.buildCommand || 'npm run build'}
+            value={form.cfBuildCommand}
+            onChange={(e) => field('cfBuildCommand')(e.target.value)}
+          />
+        </Field>
+
+        <Field
+          label="Output directory"
+          hint={preset?.destinationDir
+            ? `Where the build writes the site. Leave empty to use the preset's "${preset.destinationDir}".`
+            : 'Where the build writes the site, relative to the root directory.'}
+        >
+          <input
+            className={inputCls}
+            placeholder={preset?.destinationDir || 'dist'}
+            value={form.cfDestinationDir}
+            onChange={(e) => field('cfDestinationDir')(e.target.value)}
+          />
+        </Field>
+
+        <Field
+          label="Root directory"
+          hint="Leave empty for the repository root, or point it at the app folder in a monorepo."
+        >
+          <input
+            className={inputCls}
+            placeholder="(repository root)"
+            value={form.cfRootDir}
+            onChange={(e) => field('cfRootDir')(e.target.value)}
+          />
+        </Field>
+
+        <Field
+          label="Production branch"
+          hint="The branch Cloudflare treats as production. Leave empty to use the service's own branch."
+        >
+          <input
+            className={inputCls}
+            placeholder="main"
+            value={form.cfProductionBranch}
+            onChange={(e) => field('cfProductionBranch')(e.target.value)}
+          />
+        </Field>
+
+        <label className="flex cursor-pointer items-start gap-2.5 rounded-xl border border-line bg-sunken p-3">
+          <input
+            type="checkbox"
+            className="mt-0.5 size-3.5 shrink-0 accent-current"
+            checked={form.cfBuildCaching}
+            onChange={(e) => setBool('cfBuildCaching')(e.target.checked)}
+          />
+          <span className="min-w-0">
+            <span className="block text-[12.5px] font-medium text-ink">Build caching</span>
+            <span className="mt-0.5 block text-[11px] leading-relaxed text-faint">
+              Reuses dependencies between builds, which is usually faster. Turn it off if a
+              build succeeds locally but fails on Cloudflare with a stale-dependency error.
+            </span>
+          </span>
+        </label>
+      </Section>
+
+      <Section title="Networking">
+        <div className="flex items-start gap-2.5 rounded-xl border border-line bg-sunken p-3.5">
+          <span className="mt-0.5 shrink-0 text-muted"><CloudflareMark size={14} /></span>
+          <p className="text-[11px] leading-relaxed text-faint">
+            Cloudflare serves the site at{' '}
+            <code className="font-mono text-muted">&lt;project&gt;.pages.dev</code> on its edge
+            network — there is no port, region or instance to configure. The project hostname is
+            stable across redeploys, so it is safe to wire into a backend as an allowed origin.
+          </p>
+        </div>
+      </Section>
+
+      <Section title="Auto-deploy">
+        <p className="rounded-lg border border-line bg-sunken px-2.5 py-2 text-[11px] leading-relaxed text-muted">
+          ShipYard creates the Pages project with Cloudflare's own{' '}
+          <strong className="font-medium text-ink">Git auto-deploy turned off</strong>, so a
+          push cannot produce a build ShipYard has no record of. Every deploy is triggered from
+          here.
         </p>
       </Section>
     </>

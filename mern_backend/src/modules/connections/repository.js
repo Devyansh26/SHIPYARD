@@ -5,11 +5,15 @@ import { ID } from '../../utils/ids.js';
 // so ON CONFLICT cannot be inferred here (that is the 42P10 trap). One
 // connection per (user, provider) is enforced by this read-then-write instead.
 export function serializeConnection(r) {
+  let scope = 'personal';
+  if (r.provider_type === 'azure') scope = 'subscription';
+  else if (typeof r.external_account_id === 'string' && r.external_account_id.startsWith('team_')) scope = 'team';
+
   return {
     id: String(r.connection_id),
     providerType: r.provider_type,
     externalAccountId: r.external_account_id ?? null,
-    scope: typeof r.external_account_id === 'string' && r.external_account_id.startsWith('team_') ? 'team' : 'personal',
+    scope,
     status: r.connection_status,
     createdAt: r.created_at ?? null,
     updatedAt: r.updated_at ?? null,

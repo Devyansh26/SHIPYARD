@@ -41,6 +41,14 @@ export const api = {
       body: JSON.stringify(teamId ? { token, teamId } : { token }),
     }),
   disconnectVercel: () => req('/api/v1/connections/vercel', { method: 'DELETE' }),
+  azureConnection: () => req('/api/v1/connections/azure'),
+  azureSubscriptions: () => req('/api/v1/connections/azure/subscriptions'),
+  selectAzureSubscription: (subscriptionId: string) =>
+    req('/api/v1/connections/azure/subscription', {
+      method: 'PATCH',
+      body: JSON.stringify({ subscriptionId }),
+    }),
+  disconnectAzure: () => req('/api/v1/connections/azure', { method: 'DELETE' }),
 
   // --- deploy targets -------------------------------------------------------
   // The target menu, served from the registry in providers/index.js. Fetched
@@ -49,6 +57,24 @@ export const api = {
   // type at once — what the "Add service" menu wants.
   deployTargets: (serviceType?: string) =>
     req(`/api/v1/deploy-targets${serviceType ? `?serviceType=${encodeURIComponent(serviceType)}` : ''}`),
+
+  // --- Cloudflare Pages (frontend target) -----------------------------------
+  // Same connection gate as the others: 409 CLOUDFLARE_NOT_CONNECTED until a
+  // token is stored. The pinned value is a Cloudflare ACCOUNT id — Pages
+  // projects are created inside one.
+  cloudflareConnection: () => req('/api/v1/connections/cloudflare'),
+  cloudflareOptions: () => req('/api/v1/connections/cloudflare/options'),
+  connectCloudflareToken: (token: string, accountId?: string) =>
+    req('/api/v1/connections/cloudflare/token', {
+      method: 'POST',
+      body: JSON.stringify(accountId ? { token, accountId } : { token }),
+    }),
+  setCloudflareAccount: (accountId: string) =>
+    req('/api/v1/connections/cloudflare/account', {
+      method: 'PATCH',
+      body: JSON.stringify({ accountId }),
+    }),
+  disconnectCloudflare: () => req('/api/v1/connections/cloudflare', { method: 'DELETE' }),
 
   // --- Render (backend target) ----------------------------------------------
   // The same connection gate as Vercel: until a key is stored, a backend
@@ -169,4 +195,5 @@ export const OAUTH = {
   // sign-in does not silently reuse the previously authorized account.
   githubSwitch: '/api/v1/auth/github?switch=1',
   vercel: '/api/v1/connections/vercel/authorize',
+  azure: '/api/v1/connections/azure/authorize',
 };

@@ -2,7 +2,7 @@ import { useCallback, useEffect, useState, type ReactNode } from 'react'
 import { api, OAUTH } from '../api'
 import { usePoll } from '../lib/hooks'
 import {
-  errCode, errMessage,
+  errCode, errMessage, providerOf,
   type Connection, type ContainerTarget, type DatabaseAttachment, type DatabaseProvider,
   type Deployment, type LatestCommit, type Service, type ServiceLink,
 } from '../lib/types'
@@ -10,9 +10,11 @@ import { Button, Field, Spinner, StatusBadge } from '../components/ui'
 import { CloseIcon, ExternalIcon, GithubMark, TYPE_ICON, VercelMark } from '../components/icons'
 import { TYPE_META, inputCls } from '../lib/meta'
 import EnvVarsTab from './EnvVarsTab'
+import CloudflareConnect from './CloudflareConnect'
 import RailwayConnect from './RailwayConnect'
 import RenderConnect from './RenderConnect'
 import SettingsTab from './SettingsTab'
+import AzureConnect from '../integrations/AzureConnect'
 
 type Tab = 'settings' | 'env' | 'deploy' | 'connection'
 
@@ -131,12 +133,7 @@ function PanelBody({
           service.serviceType === 'database'
             // A database node connects to Neon/Atlas, not to a deploy target.
             ? <DatabaseConnectionTab projectId={projectId} service={service} onSaved={onSaved} />
-            : service.serviceType === 'backend'
-              // A backend's connection depends on where it deploys: Render and
-              // Railway each need the user's own account, the container host
-              // needs nothing at all.
-              ? <BackendConnectionTab projectId={projectId} service={service} onSaved={onSaved} />
-              : <ConnectionTab projectId={projectId} service={service} onSaved={onSaved} />
+            : <DeployConnectionTab projectId={projectId} service={service} onSaved={onSaved} />
         )}
       </div>
     </>
@@ -226,6 +223,23 @@ function DeployTab({
       } else if (code === 'RAILWAY_NOT_CONNECTED') {
         setError('Connect your Railway account first.')
         onNeedConnection()
+      } else if (code === 'CLOUDFLARE_NOT_CONNECTED') {
+        setError('Connect your Cloudflare account first.')
+        onNeedConnection()
+      } else if (
+        code === 'CLOUDFLARE_ACCOUNT_REQUIRED' || code === 'CLOUDFLARE_ACCOUNT_MISMATCH'
+        || code === 'CLOUDFLARE_NO_ACCOUNTS'
+      ) {
+        setError(errMessage(e, 'Choose which Cloudflare account to deploy into.'))
+        onNeedConnection()
+      } else if (code === 'CLOUDFLARE_GIT_NOT_CONNECTED') {
+        // Not a credential problem: Cloudflare's GitHub App has to be
+        // installed once from their dashboard, and the message says how.
+        setError(errMessage(e, 'Cloudflare is not authorised on your GitHub repository yet.'))
+        onNeedConnection()
+      } else if (code === 'CLOUDFLARE_UNAUTHORIZED' || code === 'CLOUDFLARE_FORBIDDEN') {
+        setError(errMessage(e, 'Cloudflare rejected the stored API token — reconnect your account.'))
+        onNeedConnection()
       } else if (code === 'RENDER_OWNER_REQUIRED' || code === 'RENDER_WORKSPACE_MISMATCH') {
         // The key works but points at several workspaces — the Connection tab
         // is where that gets resolved.
@@ -242,6 +256,9 @@ function DeployTab({
         onNeedConnection()
       } else if (code === 'RAILWAY_UNAUTHORIZED') {
         setError('Railway rejected the stored token — reconnect your account.')
+      } else if (code === 'AZURE_NOT_CONNECTED' || code === 'AZURE_SUBSCRIPTION_REQUIRED') {
+        setError('Connect your Microsoft Azure account and select a subscription first.')
+        onNeedConnection()
         onNeedConnection()
       } else if (code === 'CONTAINER_TARGET_NOT_CONFIGURED') {
         setError(errMessage(e, 'The container host is not configured on this server.'))
@@ -521,27 +538,49 @@ function CommitCard({
  * An unrecognised target falls through to the container host, matching the
  * server's own fallback for a service with no stored choice.
  */
-const BACKEND_CONNECT: Record<string, { title: string; render: () => ReactNode }> = {
+/**
+ * The Connection tab, dispatched on the service's PROVIDER.
+ *
+ * Keyed on provider rather than service type because the two do not line up:
+ * Azure serves both frontends and backends, Cloudflare Pages only frontends,
+ * Render and Railway only backends. One table keyed on the thing that actually
+ * decides the panel means adding a provider is one entry here, not another
+ * nested ternary.
+ *
+ * Every credentialed provider gets the same shape — the account gate, then the
+ * databases this service reads — because they are the same kind of thing.
+ */
+const PROVIDER_CONNECT: Record<string, { title: string; render: () => ReactNode }> = {
+  azure: { title: 'Microsoft Azure', render: () => <AzureConnect /> },
+  cloudflare: { title: 'Cloudflare account', render: () => <CloudflareConnect /> },
   render: { title: 'Render account', render: () => <RenderConnect /> },
   railway: { title: 'Railway project', render: () => <RailwayConnect /> },
 }
 
-function BackendConnectionTab({
+function DeployConnectionTab({
   projectId, service, onSaved,
 }: { projectId: string; service: Service; onSaved: (s: Service) => void }) {
-  const target = service.serviceConfig?.deployTarget ?? 'container'
-  const entry = BACKEND_CONNECT[target]
+  // Falls back to the service type's default, matching the server: a frontend
+  // with no explicit choice is Vercel, a backend is the container host.
+  const provider = providerOf(service)
+    ?? (service.serviceType === 'frontend' ? 'vercel' : 'container')
+  const entry = PROVIDER_CONNECT[provider]
 
-  if (!entry) {
-    return <ContainerTargetTab projectId={projectId} service={service} onSaved={onSaved} />
+  if (entry) {
+    return (
+      <div className="space-y-6">
+        <Section title={entry.title}>{entry.render()}</Section>
+        <LinkedDatabases projectId={projectId} service={service} onSaved={onSaved} />
+      </div>
+    )
   }
 
-  return (
-    <div className="space-y-6">
-      <Section title={entry.title}>{entry.render()}</Section>
-      <LinkedDatabases projectId={projectId} service={service} onSaved={onSaved} />
-    </div>
-  )
+  // The two targets with panels of their own: the container host reports
+  // server-level readiness instead of an account, and Vercel's panel predates
+  // the table and carries its own GitHub guidance.
+  return provider === 'container'
+    ? <ContainerTargetTab projectId={projectId} service={service} onSaved={onSaved} />
+    : <ConnectionTab projectId={projectId} service={service} onSaved={onSaved} />
 }
 
 function ContainerTargetTab({

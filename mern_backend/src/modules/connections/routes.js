@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 import { Router } from 'express';
 import { z } from 'zod';
-import { env, isProd, vercelOAuthConfigured } from '../../config/env.js';
+import { env, isProd, vercelOAuthConfigured, azureOAuthConfigured } from '../../config/env.js';
 import { frontendUrl } from '../../config/urls.js';
 import { requireAuth } from '../../middleware/auth.js';
 import { validate } from '../../middleware/validate.js';
@@ -9,11 +9,23 @@ import { asyncHandler } from '../../utils/asyncHandler.js';
 import { encryptSecret } from '../../utils/crypto.js';
 import {
   createAdapter, createKeylessAdapter, containerTargetConfigured, SUPPORTED_PROVIDERS,
-} from '../providers/index.js';
+} from '../../integrations/index.js';
+import {
+  buildAzureAuthorizeUrl,
+  exchangeAzureCode,
+  parseAzureCredentials,
+  serializeAzureCredentials,
+  signAzureState,
+  verifyAzureState,
+} from '../../integrations/providers/azure/auth/oauth.js';
+import { listAzureSubscriptions } from '../../integrations/providers/azure/auth/subscriptions.js';
 import { DATABASE_PROVIDERS, publicProvider } from '../providers/database.js';
-import { listConnections, upsertConnection, revokeConnection, findConnection } from './repository.js';
+import {
+  listConnections, upsertConnection, revokeConnection, findConnection, updateConnectionCredentials,
+} from './repository.js';
 
 const STATE_COOKIE = 'vercel_oauth_state';
+const AZURE_STATE_COOKIE = 'azure_oauth_state';
 
 function stateCookieOptions() {
   return { httpOnly: true, secure: isProd, sameSite: 'lax', path: '/', maxAge: 10 * 60 * 1000 };
@@ -75,6 +87,7 @@ router.get('/', requireAuth, asyncHandler(async (req, res) => {
     connections: await listConnections(req.userId),
     supported: SUPPORTED_PROVIDERS,
     vercelOAuthAvailable: vercelOAuthConfigured,
+    azureOAuthAvailable: azureOAuthConfigured,
   });
 }));
 
@@ -175,6 +188,123 @@ router.get('/container', requireAuth, asyncHandler(async (_req, res) => {
 
 router.delete('/vercel', requireAuth, asyncHandler(async (req, res) => {
   await revokeConnection(req.userId, 'vercel');
+  res.status(204).send();
+}));
+
+// --- Microsoft Azure OAuth 2.0 & Subscription Management --------------------
+router.get('/azure/authorize', requireAuth, asyncHandler(async (req, res) => {
+  const state = signAzureState(req.userId);
+  res.cookie(AZURE_STATE_COOKIE, state, stateCookieOptions());
+  res.redirect(buildAzureAuthorizeUrl(state));
+}));
+
+router.get('/azure/callback', requireAuth, asyncHandler(async (req, res) => {
+  const { code, state, error } = req.query;
+  if (error || !code) {
+    return res.redirect(frontendUrl('/projects', { azure: 'denied' }));
+  }
+  const stateStr = typeof state === 'string' ? state : '';
+  const cookieMatches = Boolean(req.cookies?.[AZURE_STATE_COOKIE] && req.cookies[AZURE_STATE_COOKIE] === stateStr);
+  const sigMatches = verifyAzureState(stateStr, req.userId);
+  if (!cookieMatches && !sigMatches) {
+    const e = new Error('Azure OAuth state mismatch — start the connection again');
+    e.status = 400; e.code = 'STATE_MISMATCH'; throw e;
+  }
+  res.clearCookie(AZURE_STATE_COOKIE, { path: '/' });
+
+  const tokenData = await exchangeAzureCode(String(code));
+  const subscriptions = await listAzureSubscriptions(tokenData.accessToken).catch(() => []);
+  const defaultSub = subscriptions.length === 1 ? subscriptions[0] : null;
+
+  const credentialsRef = serializeAzureCredentials({
+    ...tokenData,
+    subscriptionId: defaultSub?.subscriptionId ?? null,
+    subscriptionName: defaultSub?.displayName ?? null,
+  });
+
+  await upsertConnection(req.userId, {
+    providerType: 'azure',
+    externalAccountId: defaultSub?.subscriptionId ?? tokenData.accountEmail ?? tokenData.accountId,
+    credentialsRef,
+  });
+
+  res.redirect(frontendUrl('/projects', { azure: 'connected' }));
+}));
+
+function buildAzureAdapterForRow(userId, row) {
+  return createAdapter({
+    providerType: 'azure',
+    credentialsRef: row.credentials_ref,
+    externalAccountId: row.external_account_id,
+    connectionId: row.connection_id,
+    onCredentialsUpdated: ({ credentialsRef, externalAccountId }) =>
+      updateConnectionCredentials(userId, row.connection_id, { externalAccountId, credentialsRef }),
+  });
+}
+
+router.get('/azure', requireAuth, asyncHandler(async (req, res) => {
+  const row = await findConnection(req.userId, 'azure');
+  if (!row || row.connection_status !== 'active') {
+    return res.status(404).json({ error: { code: 'AZURE_NOT_CONNECTED', message: 'Azure is not connected' } });
+  }
+  const adapter = buildAzureAdapterForRow(req.userId, row);
+  res.json({ connection: { id: String(row.connection_id), ...(await adapter.verify()) } });
+}));
+
+router.get('/azure/subscriptions', requireAuth, asyncHandler(async (req, res) => {
+  const row = await findConnection(req.userId, 'azure');
+  if (!row || row.connection_status !== 'active') {
+    return res.status(404).json({ error: { code: 'AZURE_NOT_CONNECTED', message: 'Azure is not connected' } });
+  }
+  const adapter = buildAzureAdapterForRow(req.userId, row);
+  const subscriptions = await adapter.listSubscriptions();
+  const creds = parseAzureCredentials(row.credentials_ref);
+  res.json({
+    subscriptions,
+    selectedSubscriptionId: creds.subscriptionId ?? null,
+  });
+}));
+
+const selectSubSchema = z.object({
+  subscriptionId: z.string().min(1).max(128),
+}).strict();
+
+router.patch('/azure/subscription', requireAuth, validate(selectSubSchema), asyncHandler(async (req, res) => {
+  const row = await findConnection(req.userId, 'azure');
+  if (!row || row.connection_status !== 'active') {
+    return res.status(404).json({ error: { code: 'AZURE_NOT_CONNECTED', message: 'Azure is not connected' } });
+  }
+  const adapter = buildAzureAdapterForRow(req.userId, row);
+  const subscriptions = await adapter.listSubscriptions();
+  const match = subscriptions.find((s) => s.subscriptionId === req.body.subscriptionId);
+  if (!match) {
+    const e = new Error('Selected Azure subscription was not found on this account');
+    e.status = 404; e.code = 'AZURE_SUBSCRIPTION_NOT_FOUND'; throw e;
+  }
+  const freshRow = await findConnection(req.userId, 'azure');
+  const creds = parseAzureCredentials(freshRow.credentials_ref);
+  const updatedRef = serializeAzureCredentials({
+    ...creds,
+    subscriptionId: match.subscriptionId,
+    subscriptionName: match.displayName,
+  });
+  await updateConnectionCredentials(req.userId, freshRow.connection_id, {
+    externalAccountId: match.subscriptionId,
+    credentialsRef: updatedRef,
+  });
+  res.json({
+    subscription: match,
+    connection: {
+      id: String(freshRow.connection_id),
+      providerType: 'azure',
+      externalAccountId: match.subscriptionId,
+      subscriptionName: match.displayName,
+    },
+  });
+}));
+
+router.delete('/azure', requireAuth, asyncHandler(async (req, res) => {
+  await revokeConnection(req.userId, 'azure');
   res.status(204).send();
 }));
 

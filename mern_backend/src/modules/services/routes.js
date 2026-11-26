@@ -7,10 +7,16 @@ import { SERVICE_TYPES } from './serviceTypes.js';
 import { listServices, createService, getService, updateService, deleteService, updateServiceCanvas } from './repository.js';
 import { teardownServiceContainers } from '../deployments/service.js';
 import { consumersOfProvider, kindForProviderType } from '../links/service.js';
-import { isAllowedTarget, allowedTargetsForServiceType } from '../providers/index.js';
+import {
+  isAllowedTarget, allowedTargetsForServiceType, providerChoiceOf,
+} from '../providers/index.js';
 
 /**
- * Rejects a `service_config.deployTarget` the service type does not allow.
+ * Rejects a per-service provider choice the service type does not allow.
+ *
+ * Both spellings are checked, because two branches wrote different keys:
+ * `provider` is canonical (Azure's UI) and `deployTarget` is the legacy one
+ * the backend target picker wrote. `providerChoiceOf` reads whichever is set.
  *
  * Resolution falls back to the type's default for an unknown value, which is
  * safe but silent — a typo would deploy somewhere the user did not choose and
@@ -19,12 +25,12 @@ import { isAllowedTarget, allowedTargetsForServiceType } from '../providers/inde
  * Absent is always fine: that is a legacy service, and the default covers it.
  */
 function assertDeployTarget(serviceType, serviceConfig) {
-  const chosen = serviceConfig?.deployTarget;
-  if (chosen === undefined || chosen === null) return;
+  const chosen = providerChoiceOf(serviceConfig);
+  if (chosen === null) return;
   if (!isAllowedTarget(serviceType, chosen)) {
-    const allowed = allowedTargetsForServiceType(serviceType).map((t) => t.deployTarget);
+    const allowed = allowedTargetsForServiceType(serviceType).map((t) => t.provider);
     const e = new Error(
-      `deployTarget "${chosen}" is not available for a ${serviceType} service. `
+      `Provider "${chosen}" is not available for a ${serviceType} service. `
       + (allowed.length > 0
         ? `Allowed: ${allowed.join(', ')}.`
         : `A ${serviceType} service does not deploy anywhere.`)
@@ -118,7 +124,7 @@ router.get('/:serviceId', asyncHandler(async (req, res) => {
 
 router.patch('/:serviceId', validate(patchSchema), asyncHandler(async (req, res) => {
   const { projectId, serviceId } = req.params;
-  if (req.body.serviceConfig?.deployTarget !== undefined) {
+  if (providerChoiceOf(req.body.serviceConfig) !== null) {
     // `service_type` cannot be patched, so the stored row is the authority on
     // which targets are allowed.
     const current = await getService(req.userId, projectId, serviceId);
@@ -151,9 +157,6 @@ router.delete('/:serviceId', asyncHandler(async (req, res) => {
   const teardown = await teardownServiceContainers(req.userId, serviceId, {
     projectId,
     serviceType: service.serviceType,
-    // A backend may deploy to Render instead of the container host; the target
-    // decides whether there is anything on a Docker host to tear down.
-    deployTarget: service.serviceConfig?.deployTarget ?? null,
   }).catch((e) => ({ queued: 0, error: e.code ?? 'ERROR' }));
 
   // Deleting a node leaves whatever it injected — a connection string, or its

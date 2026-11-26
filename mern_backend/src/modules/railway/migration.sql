@@ -43,7 +43,7 @@ BEGIN
     INTO offenders
     FROM provider_connections
    WHERE provider_type NOT IN
-         ('vercel', 'render', 'railway', 'neon', 'atlas', 'homelab', 'azure');
+         ('vercel', 'render', 'railway', 'cloudflare', 'azure', 'neon', 'atlas', 'homelab');
 
   IF offenders IS NOT NULL THEN
     RAISE EXCEPTION
@@ -59,7 +59,7 @@ ALTER TABLE provider_connections
 ALTER TABLE provider_connections
   ADD CONSTRAINT provider_connections_provider_type_check
   CHECK (provider_type IN
-         ('vercel', 'render', 'railway', 'neon', 'atlas', 'homelab', 'azure'));
+         ('vercel', 'render', 'railway', 'cloudflare', 'azure', 'neon', 'atlas', 'homelab'));
 
 COMMIT;
 
