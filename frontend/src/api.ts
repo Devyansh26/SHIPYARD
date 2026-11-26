@@ -1,7 +1,14 @@
-const opts: RequestInit = { credentials: 'include' };
+import { CREDENTIALS, backendUrl } from './lib/backend';
+
+// `credentials: 'include'` is what sends the session cookie cross-origin. It
+// was already here for the same-origin case; it is load-bearing once the API
+// lives on another host.
+const opts: RequestInit = { credentials: CREDENTIALS };
 
 async function req(path: string, init?: RequestInit) {
-  const res = await fetch(path, { ...opts, ...init, headers: { 'Content-Type': 'application/json', ...(init?.headers || {}) } });
+  // Every call routes through `backendUrl()`: relative in dev so Vite's proxy
+  // handles it, absolute once VITE_BACKEND_URL is set for a deployed build.
+  const res = await fetch(backendUrl(path), { ...opts, ...init, headers: { 'Content-Type': 'application/json', ...(init?.headers || {}) } });
   const text = await res.text();
   let body = null;
   try { body = text ? JSON.parse(text) : null; } catch { body = { _raw: text }; }
@@ -188,12 +195,16 @@ export const api = {
     req(`/api/v1/projects/${pid}/services/${sid}/links/resync`, { method: 'POST' }),
 };
 
-// OAuth endpoints are browser redirects, not fetches.
+// OAuth endpoints are browser redirects, not fetches — but they still have to
+// point at the BACKEND. These are used as `<a href>`, so a relative path would
+// navigate to the static frontend host once deployed and 404 instead of
+// starting the OAuth flow. `backendUrl()` makes them absolute whenever
+// VITE_BACKEND_URL is set.
 export const OAUTH = {
-  github: '/api/v1/auth/github',
+  github: backendUrl('/api/v1/auth/github'),
   // Forces GitHub's authorize screen and drops our session first, so a second
   // sign-in does not silently reuse the previously authorized account.
-  githubSwitch: '/api/v1/auth/github?switch=1',
-  vercel: '/api/v1/connections/vercel/authorize',
-  azure: '/api/v1/connections/azure/authorize',
+  githubSwitch: backendUrl('/api/v1/auth/github?switch=1'),
+  vercel: backendUrl('/api/v1/connections/vercel/authorize'),
+  azure: backendUrl('/api/v1/connections/azure/authorize'),
 };
